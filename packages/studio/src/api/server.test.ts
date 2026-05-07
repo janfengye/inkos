@@ -100,6 +100,7 @@ const endpointMocks = [
     ...(id === "google" ? { checkModel: "gemini-2.5-flash" } : {}),
     ...(id === "minimax" ? { checkModel: "MiniMax-M2.7" } : {}),
     ...(id === "ollama" ? { checkModel: "llama3.2:3b" } : {}),
+    ...(id === "volcengine" ? { checkModel: "doubao-lite-32k" } : {}),
     models: [
       { id: `${id}-model`, maxOutput: 4096, contextWindowTokens: 32768, enabled: true },
       { id: `${id}-disabled`, maxOutput: 4096, contextWindowTokens: 32768, enabled: false },
@@ -1305,6 +1306,48 @@ describe("createStudioServer daemon lifecycle", () => {
     expect(chatCompletionMock.mock.calls.map((call) => call[1])).not.toContain("MiniMax-M2.7");
   });
 
+  it("uses discovered Volcengine models before the stale built-in check model", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: [{ id: "doubao-seed-2.0-lite" }] }),
+    });
+    vi.stubGlobal("fetch", fetchMock as typeof fetch);
+    createLLMClientMock.mockImplementation(((cfg: unknown) => cfg) as any);
+    chatCompletionMock.mockImplementation(async (_client: any, model: string) => {
+      if (model === "doubao-seed-2.0-lite") {
+        return {
+          content: "pong",
+          usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+        };
+      }
+      throw new Error(`unexpected model: ${model}`);
+    });
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/services/volcengine/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        apiKey: "volc-key",
+        baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
+        apiFormat: "responses",
+        stream: true,
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      ok: true,
+      selectedModel: "doubao-seed-2.0-lite",
+      detected: {
+        modelsSource: "api",
+      },
+    });
+    expect(chatCompletionMock.mock.calls.map((call) => call[1])).not.toContain("doubao-lite-32k");
+  });
+
   it("uses discovered Ollama models without requiring an API key or the built-in check model", async () => {
     await writeFile(join(root, "inkos.json"), JSON.stringify({
       ...projectConfig,
@@ -1640,6 +1683,35 @@ describe("createStudioServer daemon lifecycle", () => {
       status: "error",
       error: "INKOS_LLM_API_KEY not set",
     });
+  });
+
+  it("surfaces LLM config errors during create instead of masking them as internal errors", async () => {
+    loadProjectConfigMock.mockRejectedValueOnce(
+      new Error("Studio LLM API key not set. Open Studio services and save an API key for the selected service."),
+    );
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/books/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        title: "Needs Key",
+        genre: "urban",
+        platform: "qidian",
+        language: "zh",
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: "LLM_CONFIG_ERROR",
+        message: "Studio LLM API key not set. Open Studio services and save an API key for the selected service.",
+      },
+    });
+    expect(processProjectInteractionRequestMock).not.toHaveBeenCalled();
   });
 
   it("uses rollback semantics for chapter rejection instead of only flipping status", async () => {
