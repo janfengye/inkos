@@ -1,9 +1,9 @@
 import type { EndpointGroup } from "../store/service/types";
 
 export const GROUP_ORDER: ReadonlyArray<EndpointGroup> = [
+  "aggregator",
   "overseas",
   "china",
-  "aggregator",
   "local",
   "codingPlan",
 ] as const;

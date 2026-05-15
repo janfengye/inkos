@@ -70,10 +70,10 @@ describe("providers structural integrity", () => {
     expect(ids).not.toContain("qwen");
   });
 
-  it("B1：中国原厂批次 1 全部收录（10 个）", () => {
+  it("B1：中国原厂批次 1 全部收录（9 个，PPIO 默认入口已下架）", () => {
     const ids = getAllEndpoints().map((p) => p.id);
     for (const id of [
-      "moonshot", "zhipu", "siliconcloud", "ppio", "bailian",
+      "moonshot", "zhipu", "siliconcloud", "bailian",
       "volcengine", "hunyuan", "baichuan", "stepfun", "wenxin",
     ]) {
       expect(ids).toContain(id);
@@ -97,10 +97,13 @@ describe("providers structural integrity", () => {
     }
   });
 
-  it("B3：中国原厂批次 3 全部收录（6 个，R5 已删 higress）", () => {
+  it("B3：中国原厂批次 3 保留公开服务列表中的原厂入口（R5 已删 higress）", () => {
     const ids = getAllEndpoints().map((p) => p.id);
-    for (const id of ["modelscope", "giteeai", "qiniu", "infiniai", "zeroone", "ai360"]) {
+    for (const id of ["zeroone", "ai360"]) {
       expect(ids).toContain(id);
+    }
+    for (const id of ["modelscope", "giteeai", "qiniu", "infiniai"]) {
+      expect(ids).not.toContain(id);
     }
     expect(ids).not.toContain("higress");
   });
@@ -117,9 +120,9 @@ describe("providers structural integrity", () => {
     expect(getEndpoint("newapi")?.baseUrl).toBe("");
   });
 
-  it("B4：总 provider 数 = 35（不含 CodingPlan 分组，R5 删 qwen / higress 后）", () => {
+  it("B4：总 provider 数 = 30（不含 CodingPlan 分组，R5 删 qwen / higress 且精简聚合入口后）", () => {
     const nonCoding = getAllEndpoints().filter((p) => p.group !== "codingPlan");
-    expect(nonCoding.length).toBe(35);
+    expect(nonCoding.length).toBe(30);
   });
 
   it("B6：CodingPlan 8 个 provider 全部收录", () => {
@@ -133,8 +136,8 @@ describe("providers structural integrity", () => {
     }
   });
 
-  it("B6：总 provider 数 = 43 (35 base + 8 CodingPlan)", () => {
-    expect(getAllEndpoints().length).toBe(43);
+  it("B6：总 provider 数 = 38 (30 base + 8 CodingPlan)", () => {
+    expect(getAllEndpoints().length).toBe(38);
   });
 
   it("B6：CodingPlan provider 都走 anthropic-messages", () => {
