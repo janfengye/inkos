@@ -233,6 +233,9 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
     resolveServiceProviderFamily: resolveServiceProviderFamilyMock,
     resolveServiceModelsBaseUrl: resolveServiceModelsBaseUrlMock,
     resolveServiceModel: resolveServiceModelMock,
+    COVER_PROVIDER_PRESETS: actual.COVER_PROVIDER_PRESETS,
+    coverSecretKey: actual.coverSecretKey,
+    resolveCoverProviderPreset: actual.resolveCoverProviderPreset,
     isApiKeyOptionalForEndpoint: actual.isApiKeyOptionalForEndpoint,
     loadSecrets: loadSecretsMock,
     saveSecrets: saveSecretsMock,
@@ -1018,6 +1021,49 @@ describe("createStudioServer daemon lifecycle", () => {
       { service: "moonshot", temperature: 0.5, apiFormat: "responses", stream: false },
       { service: "custom", name: "内网GPT", baseUrl: "https://llm.internal.corp/v1", temperature: 0.9, apiFormat: "responses", stream: false },
     ]);
+  });
+
+  it("refreshes top-level llm mirror when switching from custom baseUrl to a preset service", async () => {
+    await writeFile(join(root, "inkos.json"), JSON.stringify({
+      ...projectConfig,
+      llm: {
+        provider: "openai",
+        service: "custom",
+        configSource: "studio",
+        baseUrl: "https://www.openclaudecode.cn/v1",
+        model: "gpt-5.4",
+        apiFormat: "chat",
+        stream: true,
+        services: [
+          { service: "custom", name: "Global LLM", baseUrl: "https://www.openclaudecode.cn/v1", apiFormat: "chat", stream: true },
+        ],
+        defaultModel: "gpt-5.4",
+      },
+    }, null, 2), "utf-8");
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const save = await app.request("http://localhost/api/v1/services/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        service: "kkaiapi",
+        defaultModel: "deepseek-v4-flash",
+        services: [
+          { service: "kkaiapi", temperature: 0.7, apiFormat: "chat", stream: true },
+        ],
+      }),
+    });
+
+    expect(save.status).toBe(200);
+
+    const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
+    expect(raw.llm.service).toBe("kkaiapi");
+    expect(raw.llm.defaultModel).toBe("deepseek-v4-flash");
+    expect(raw.llm.model).toBe("deepseek-v4-flash");
+    expect(raw.llm.provider).toBe("openai");
+    expect(raw.llm.baseUrl).toBe("https://api.kkaiapi.com/v1");
   });
 
   it("deletes a custom service config and stored secret", async () => {
@@ -1869,6 +1915,61 @@ describe("createStudioServer daemon lifecycle", () => {
       error: expect.stringContaining("API Key"),
     });
     expect(saveSecretsMock).not.toHaveBeenCalled();
+  });
+
+  it("saves cover generation config and a separate cover API key", async () => {
+    loadSecretsMock.mockResolvedValue({ services: {} });
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const saveConfig = await app.request("http://localhost/api/v1/cover/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        service: "kkaiapi",
+        model: "gpt-image-2",
+      }),
+    });
+    expect(saveConfig.status).toBe(200);
+
+    const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
+    expect(raw.llm.cover).toEqual({
+      service: "kkaiapi",
+      model: "gpt-image-2",
+    });
+
+    const saveSecret = await app.request("http://localhost/api/v1/cover/secret/kkaiapi", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ apiKey: "sk-cover" }),
+    });
+    expect(saveSecret.status).toBe(200);
+    expect(saveSecretsMock).toHaveBeenCalledWith(root, {
+      services: {
+        "cover:kkaiapi": { apiKey: "sk-cover" },
+      },
+    });
+  });
+
+  it("serves generated project cover images without exposing arbitrary files", async () => {
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+    const imagePath = join(root, "shorts", "demo", "final", "cover.png");
+    await mkdir(join(root, "shorts", "demo", "final"), { recursive: true });
+    await writeFile(imagePath, Buffer.from("fake-png"));
+    await writeFile(join(root, "shorts", "demo", "final", "cover.txt"), "nope", "utf-8");
+
+    const ok = await app.request("http://localhost/api/v1/project/files/shorts/demo/final/cover.png");
+    expect(ok.status).toBe(200);
+    expect(ok.headers.get("content-type")).toContain("image/png");
+    expect(Buffer.from(await ok.arrayBuffer()).toString("utf-8")).toBe("fake-png");
+
+    const unsupported = await app.request("http://localhost/api/v1/project/files/shorts/demo/final/cover.txt");
+    expect(unsupported.status).toBe(415);
+
+    const traversal = await app.request("http://localhost/api/v1/project/files/../inkos.json");
+    expect([400, 404]).toContain(traversal.status);
   });
 
   it("rejects create requests when a complete book with the same id already exists", async () => {

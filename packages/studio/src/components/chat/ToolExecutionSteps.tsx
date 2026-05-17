@@ -12,6 +12,7 @@ import {
   ChevronDown,
   Wrench,
 } from "lucide-react";
+import { buildApiUrl } from "../../hooks/use-api";
 
 // -- Status rendering helpers --
 
@@ -75,6 +76,45 @@ function formatDuration(startedAt: number, completedAt?: number): string {
   return secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m ${secs % 60}s`;
 }
 
+function encodeProjectPath(path: string): string {
+  return path.split("/").map((part) => encodeURIComponent(part)).join("/");
+}
+
+function extractResultPath(result: string | undefined, label: string): string | null {
+  if (!result) return null;
+  const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = result.match(new RegExp(`^${escaped}:\\s*(.+)$`, "im"));
+  const path = match?.[1]?.trim();
+  return path || null;
+}
+
+function ShortFictionResultPreview({ exec }: { exec: ToolExecution }) {
+  if (!["short_fiction_run", "generate_cover"].includes(exec.tool) || exec.status !== "completed") return null;
+  const coverPath = extractResultPath(exec.result, "Cover image");
+  if (!coverPath || !/\.(png|jpe?g|webp)$/iu.test(coverPath)) return null;
+
+  const coverUrl = buildApiUrl(`/project/files/${encodeProjectPath(coverPath)}`);
+  if (!coverUrl) return null;
+
+  return (
+    <div className="mx-3 mb-3 mt-1 overflow-hidden rounded-xl border border-border/40 bg-background/70">
+      <img
+        src={coverUrl}
+        alt="短篇封面"
+        className="block max-h-[360px] w-full object-contain bg-muted/20"
+        loading="lazy"
+      />
+      <div className="border-t border-border/40 px-3 py-2 text-[11px] text-muted-foreground break-all">
+        {coverPath}
+      </div>
+    </div>
+  );
+}
+
+function isPipelineTool(tool: string): boolean {
+  return tool === "sub_agent" || tool === "short_fiction_run" || tool === "generate_cover";
+}
+
 // -- Live elapsed timer hook --
 
 function useElapsedTimer(startedAt: number, active: boolean): number {
@@ -124,6 +164,7 @@ function PipelineExecution({ exec }: { exec: ToolExecution }) {
           <ChevronDown size={14} className={`text-muted-foreground transition-transform ${open ? "rotate-180" : ""}`} />
         </div>
       </CollapsibleTrigger>
+      <ShortFictionResultPreview exec={exec} />
       <CollapsibleContent>
         <div className="px-3 pb-3 pt-1">
           {/* Real-time execution logs */}
@@ -198,7 +239,7 @@ type RenderGroup =
   | { type: "pipeline"; exec: ToolExecution }
   | { type: "utilities"; execs: ToolExecution[] };
 
-function groupChronologically(executions: ToolExecution[]): RenderGroup[] {
+export function groupToolExecutionsChronologically(executions: ToolExecution[]): RenderGroup[] {
   const groups: RenderGroup[] = [];
   let utilBuf: ToolExecution[] = [];
 
@@ -210,7 +251,7 @@ function groupChronologically(executions: ToolExecution[]): RenderGroup[] {
   };
 
   for (const exec of executions) {
-    if (exec.tool === "sub_agent") {
+    if (isPipelineTool(exec.tool)) {
       flushUtils();
       groups.push({ type: "pipeline", exec });
     } else {
@@ -222,7 +263,7 @@ function groupChronologically(executions: ToolExecution[]): RenderGroup[] {
 }
 
 export function ToolExecutionSteps({ executions }: ToolExecutionStepsProps) {
-  const groups = useMemo(() => groupChronologically(executions), [executions]);
+  const groups = useMemo(() => groupToolExecutionsChronologically(executions), [executions]);
 
   return (
     <div className="space-y-2 mt-2">

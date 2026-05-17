@@ -49,12 +49,22 @@ export class LengthNormalizerAgent extends BaseAgent {
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
       ],
-      { temperature: 0.2 },
+      {
+        temperature: 0.2,
+        maxTokens: this.estimateMaxTokens(input.lengthSpec),
+      },
     );
 
-    const normalizedContent = this.sanitizeNormalizedContent(response.content, input.chapterContent);
+    const sanitizedContent = this.sanitizeNormalizedContent(response.content, input.chapterContent);
+    const sanitizedCount = countChapterLength(sanitizedContent, input.lengthSpec.countingMode);
+    const wasTruncated = sanitizedContent !== input.chapterContent
+      && sanitizedCount < input.lengthSpec.hardMin
+      && this.looksTruncated(sanitizedContent);
+    const normalizedContent = wasTruncated ? input.chapterContent : sanitizedContent;
     const finalCount = countChapterLength(normalizedContent, input.lengthSpec.countingMode);
-    const warning = this.buildWarning(finalCount, input.lengthSpec);
+    const warning = wasTruncated
+      ? "Length normalizer output appeared truncated; kept original chapter."
+      : this.buildWarning(finalCount, input.lengthSpec);
 
     return {
       normalizedContent,
@@ -127,6 +137,11 @@ ${input.chapterContent}`;
     return `Final count ${finalCount} is outside the soft range ${lengthSpec.softMin}-${lengthSpec.softMax} after one normalization pass.`;
   }
 
+  private estimateMaxTokens(lengthSpec: LengthSpec): number {
+    const upperBound = Math.max(lengthSpec.hardMax, lengthSpec.softMax, lengthSpec.target);
+    return Math.max(1024, Math.ceil(upperBound * 1.5));
+  }
+
   private sanitizeNormalizedContent(rawContent: string, fallbackContent: string): string {
     const trimmed = rawContent.trim();
     if (!trimmed) return fallbackContent;
@@ -144,6 +159,15 @@ ${input.chapterContent}`;
     }
 
     return trimmed;
+  }
+
+  private looksTruncated(content: string): boolean {
+    const trimmed = content.trim();
+    if (!trimmed) return false;
+    if (trimmed.endsWith("```")) return false;
+    if (/[。！？!?」』”’）)\]】》…]$/.test(trimmed)) return false;
+    if (/\n\s*$/.test(content) && /[，,；;：:]$/.test(trimmed)) return true;
+    return /[，,；;：:、]$/.test(trimmed) || /[\u4e00-\u9fffA-Za-z0-9]$/.test(trimmed);
   }
 
   private extractFirstFencedBlock(content: string): string | undefined {

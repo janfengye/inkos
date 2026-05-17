@@ -217,6 +217,41 @@ export {
   type ParsedDraftResponse,
 } from "./interaction/draft-directive-parser.js";
 
+export {
+  SHORT_FICTION_DEFAULT_CHAPTERS,
+  SHORT_FICTION_MIN_CHAPTERS,
+  SHORT_FICTION_MAX_CHAPTERS,
+  SHORT_FICTION_DEFAULT_CHARS_PER_CHAPTER,
+  SHORT_FICTION_MIN_CHARS_PER_CHAPTER,
+  SHORT_FICTION_MAX_CHARS_PER_CHAPTER,
+  ShortFictionOutlineAgent,
+  ShortFictionOutlineReviewerAgent,
+  ShortFictionOutlineReviserAgent,
+  ShortFictionWriterAgent,
+  ShortFictionDraftReviewerAgent,
+  ShortFictionDraftReviserAgent,
+  ShortFictionPackagingAgent,
+  parseShortFictionBatchDraft,
+  validateShortFictionDraftForFinal,
+  renderShortFictionDraftMarkdown,
+  type ShortFictionOutline,
+  type ShortFictionBatchDraft,
+  type ShortFictionChapter,
+  type ShortFictionSalesPackage,
+  type ShortFictionReference,
+} from "./agents/short-fiction.js";
+export {
+  generateShortFictionCover,
+  runShortFictionProduction,
+  extractResponsesImageBase64,
+  resolveCoverApiKey,
+  type ShortFictionCoverOptions,
+  type ShortFictionCoverResult,
+  type ShortFictionRunOptions,
+  type ShortFictionRunResult,
+  type ShortFictionRunRuntimes,
+} from "./pipeline/short-fiction-runner.js";
+
 // Agent (pi-agent integration)
 export * from "./agent/index.js";
 
@@ -237,6 +272,13 @@ export {
 } from "./llm/service-presets.js";
 export { resolveServiceModel, type ResolvedModel } from "./llm/service-resolver.js";
 export { loadSecrets, saveSecrets, getServiceApiKey, type SecretsFile } from "./llm/secrets.js";
+export {
+  COVER_PROVIDER_PRESETS,
+  coverSecretKey,
+  resolveCoverProviderPreset,
+  type CoverProviderId,
+  type CoverProviderPreset,
+} from "./llm/cover-providers.js";
 export { migrateConfig, type MigrationResult } from "./llm/config-migration.js";
 export { getAllEndpoints, getEndpoint, type InkosEndpoint, type InkosModel, type EndpointGroup } from "./llm/providers/index.js";
 export { probeModelsFromUpstream, type ProbedModel } from "./llm/providers/probe.js";
@@ -267,6 +309,7 @@ export { parseSettlerDeltaOutput, type SettlerDeltaOutput } from "./agents/settl
 export { FanficCanonImporter, type FanficCanonOutput } from "./agents/fanfic-canon-importer.js";
 export { getFanficDimensionConfig, FANFIC_DIMENSIONS, type FanficDimensionConfig } from "./agents/fanfic-dimensions.js";
 export { buildFanficCanonSection, buildCharacterVoiceProfiles, buildFanficModeInstructions } from "./agents/fanfic-prompt-sections.js";
+export * from "./prompts/index.js";
 
 // Utils
 export { isNewLayoutBook } from "./utils/outline-paths.js";

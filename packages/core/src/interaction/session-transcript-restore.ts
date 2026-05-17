@@ -431,6 +431,8 @@ function messageEventsToInteractionMessages(events: MessageEvent[]): Interaction
     edit: "编辑文件",
     grep: "搜索",
     ls: "列目录",
+    short_fiction_run: "短篇生产",
+    generate_cover: "生成封面",
   };
 
   const messages: InteractionMessage[] = [];

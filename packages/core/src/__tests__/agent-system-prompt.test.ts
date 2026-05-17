@@ -13,6 +13,7 @@ describe("buildAgentSystemPrompt", () => {
       expect(prompt).toContain("核心冲突");
       expect(prompt).toContain("architect");
       expect(prompt).toContain("sub_agent");
+      expect(prompt).toContain("short_fiction_run");
       expect(prompt).toContain("title");
     });
 
@@ -23,6 +24,7 @@ describe("buildAgentSystemPrompt", () => {
       expect(prompt).toContain("Genre");
       expect(prompt).toContain("Protagonist");
       expect(prompt).toContain("Core conflict");
+      expect(prompt).toContain("short_fiction_run");
       expect(prompt).toContain("title");
     });
 
@@ -58,6 +60,7 @@ describe("buildAgentSystemPrompt", () => {
       expect(prompt).toContain("write_truth_file");
       expect(prompt).toContain("rename_entity");
       expect(prompt).toContain("patch_chapter_text");
+      expect(prompt).toContain("short_fiction_run");
       expect(prompt).toContain("edit");
       expect(prompt).toContain("write");
       expect(prompt).toContain("grep");

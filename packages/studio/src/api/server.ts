@@ -37,7 +37,10 @@ import {
   chatCompletion,
   buildExportArtifact,
   GLOBAL_ENV_PATH,
+  COVER_PROVIDER_PRESETS,
   Scheduler,
+  coverSecretKey,
+  resolveCoverProviderPreset,
   type ResolvedModel,
   type PipelineConfig,
   type ProjectConfig,
@@ -75,6 +78,8 @@ const AGENT_LABELS: Record<string, string> = {
 };
 const TOOL_LABELS: Record<string, string> = {
   read: "读取文件", edit: "编辑文件", grep: "搜索", ls: "列目录",
+  short_fiction_run: "短篇生产",
+  generate_cover: "生成封面",
 };
 
 function resolveToolLabel(tool: string, agent?: string): string {
@@ -419,6 +424,39 @@ function mergeServiceConfig(existing: ServiceConfigEntry[], updates: ServiceConf
     merged.set(serviceConfigKey(update), update);
   }
   return [...merged.values()];
+}
+
+function normalizeCoverConfig(raw: unknown): { service: string; model: string } | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const record = raw as Record<string, unknown>;
+  const service = typeof record.service === "string" ? record.service : "";
+  const preset = resolveCoverProviderPreset(service);
+  if (!preset) return undefined;
+  const requestedModel = typeof record.model === "string" ? record.model.trim() : "";
+  const model = requestedModel && preset.models.includes(requestedModel)
+    ? requestedModel
+    : preset.defaultModel;
+  return { service: preset.service, model };
+}
+
+function syncTopLevelLlmMirror(llm: Record<string, unknown>): void {
+  const selectedService = typeof llm.service === "string" ? llm.service : undefined;
+  if (!selectedService) return;
+
+  const services = normalizeServiceConfig(llm.services);
+  const selectedEntry = services.find((entry) => serviceConfigKey(entry) === selectedService)
+    ?? (!isCustomServiceId(selectedService) ? { service: selectedService } : undefined);
+  if (!selectedEntry) return;
+
+  const preset = resolveServicePreset(selectedEntry.service);
+  llm.provider = resolveServiceProviderFamily(selectedEntry.service) ?? "openai";
+  llm.baseUrl = selectedEntry.baseUrl ?? preset?.baseUrl ?? "";
+
+  const defaultModel = typeof llm.defaultModel === "string" ? llm.defaultModel.trim() : "";
+  if (defaultModel) llm.model = defaultModel;
+  if (selectedEntry.temperature !== undefined) llm.temperature = selectedEntry.temperature;
+  if (selectedEntry.apiFormat !== undefined) llm.apiFormat = selectedEntry.apiFormat;
+  if (selectedEntry.stream !== undefined) llm.stream = selectedEntry.stream;
 }
 
 async function loadRawConfig(root: string): Promise<Record<string, unknown>> {
@@ -1485,8 +1523,80 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     if (body.service !== undefined) {
       llm.service = body.service;
     }
+    syncTopLevelLlmMirror(llm);
     await saveRawConfig(root, config);
     return c.json({ ok: true });
+  });
+
+  app.get("/api/v1/cover/config", async (c) => {
+    const config = await loadRawConfig(root);
+    const llm = (config.llm as Record<string, unknown> | undefined) ?? {};
+    const cover = normalizeCoverConfig(llm.cover);
+    const secrets = await loadSecrets(root);
+    return c.json({
+      service: cover?.service ?? null,
+      model: cover?.model ?? null,
+      providers: COVER_PROVIDER_PRESETS.map((provider) => ({
+        service: provider.service,
+        label: provider.label,
+        baseUrl: provider.baseUrl,
+        defaultModel: provider.defaultModel,
+        models: provider.models,
+        connected: Boolean(secrets.services[coverSecretKey(provider.service)]?.apiKey || secrets.services[provider.service]?.apiKey),
+      })),
+    });
+  });
+
+  app.put("/api/v1/cover/config", async (c) => {
+    const body = await c.req.json<{ service?: string; model?: string }>();
+    const preset = resolveCoverProviderPreset(body.service);
+    if (!preset) {
+      return c.json({ error: "Unsupported cover service" }, 400);
+    }
+    const model = typeof body.model === "string" && preset.models.includes(body.model)
+      ? body.model
+      : preset.defaultModel;
+
+    const config = await loadRawConfig(root);
+    config.llm = config.llm ?? {};
+    const llm = config.llm as Record<string, unknown>;
+    llm.cover = {
+      service: preset.service,
+      model,
+    };
+    await saveRawConfig(root, config);
+    return c.json({ ok: true, service: preset.service, model });
+  });
+
+  app.get("/api/v1/cover/secret/:service", async (c) => {
+    const service = c.req.param("service");
+    if (!resolveCoverProviderPreset(service)) {
+      return c.json({ error: "Unsupported cover service" }, 400);
+    }
+    const secrets = await loadSecrets(root);
+    return c.json({ apiKey: secrets.services[coverSecretKey(service)]?.apiKey ?? "" });
+  });
+
+  app.put("/api/v1/cover/secret/:service", async (c) => {
+    const service = c.req.param("service");
+    if (!resolveCoverProviderPreset(service)) {
+      return c.json({ error: "Unsupported cover service" }, 400);
+    }
+    const body = await c.req.json<{ apiKey?: string }>();
+    const trimmedKey = body.apiKey?.trim() ?? "";
+    if (trimmedKey && !isHeaderSafeApiKey(trimmedKey)) {
+      return c.json({ error: "API Key 包含不能放入 HTTP Authorization header 的字符，请只粘贴原始密钥。" }, 400);
+    }
+
+    const secrets = await loadSecrets(root);
+    const key = coverSecretKey(service);
+    if (trimmedKey) {
+      secrets.services[key] = { apiKey: trimmedKey };
+    } else {
+      delete secrets.services[key];
+    }
+    await saveSecrets(root, secrets);
+    return c.json({ ok: true, service });
   });
 
   app.delete("/api/v1/services/:service", async (c) => {
@@ -1721,6 +1831,39 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
       stream: currentConfig.llm.stream,
       temperature: currentConfig.llm.temperature,
     });
+  });
+
+  app.get("/api/v1/project/files/:file{.+}", async (c) => {
+    const file = c.req.param("file");
+    const resolved = resolve(root, file);
+    const rel = relative(root, resolved);
+    if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
+      return c.json({ error: "Invalid project file path" }, 400);
+    }
+
+    const ext = resolved.split(".").pop()?.toLowerCase() ?? "";
+    const contentTypes: Record<string, string> = {
+      png: "image/png",
+      jpg: "image/jpeg",
+      jpeg: "image/jpeg",
+      webp: "image/webp",
+    };
+    const contentType = contentTypes[ext];
+    if (!contentType) {
+      return c.json({ error: "Unsupported project file type" }, 415);
+    }
+
+    try {
+      const content = await readFile(resolved);
+      return new Response(content, {
+        headers: {
+          "Content-Type": contentType,
+          "Cache-Control": "no-store",
+        },
+      });
+    } catch {
+      return c.notFound();
+    }
   });
 
   // --- Config editing ---
