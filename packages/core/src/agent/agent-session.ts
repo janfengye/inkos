@@ -10,8 +10,6 @@ import {
   createRenameEntityTool,
   createSubAgentTool,
   createReadTool,
-  createEditTool,
-  createWriteFileTool,
   createGrepTool,
   createLsTool,
   createWriteTruthFileTool,
@@ -488,8 +486,6 @@ function createAgentToolsForMode(params: {
     createWriteTruthFileTool(params.pipeline, params.projectRoot, params.bookId),
     createRenameEntityTool(params.pipeline, params.projectRoot, params.bookId),
     createPatchChapterTextTool(params.pipeline, params.projectRoot, params.bookId),
-    createEditTool(params.projectRoot),
-    createWriteFileTool(params.projectRoot),
     createGrepTool(params.projectRoot),
     createLsTool(params.projectRoot),
   ];

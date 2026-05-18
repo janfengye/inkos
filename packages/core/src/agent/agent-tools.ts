@@ -410,10 +410,10 @@ const GenerateCoverParams = Type.Object({
     description: "Optional selling points separated by semicolons or new lines, e.g. 婚姻背叛；证据反杀；女主冷笑.",
   })),
   coverPrompt: Type.Optional(Type.String({
-    description: "Optional concrete visual direction. Keep it short and commercial; do not paste the whole story.",
+    description: "Optional concrete or revised visual direction. Use this when the user changes the cover prompt through chat. Keep it short and commercial; do not paste the whole story.",
   })),
   outputDir: Type.Optional(Type.String({
-    description: "Optional project-relative directory for cover-prompt.md and cover.png. For an existing short, use its final directory.",
+    description: "Optional project-relative directory for cover-prompt.md and cover.png. For an existing short or cover prompt revision, use its existing final/cover directory to overwrite that cover.",
   })),
   coverBaseUrl: Type.Optional(Type.String({
     description: "Optional image API base URL. Usually omit and use Studio cover config.",
@@ -441,7 +441,7 @@ export function createGenerateCoverTool(
     name: "generate_cover",
     description:
       "Generate only a cover image and cover prompt from a title/synopsis/visual direction. " +
-      "Use this when the user asks to create or regenerate a cover without rerunning story generation.",
+      "Use this when the user asks to create/regenerate a cover or revise the cover prompt through chat, without rerunning story generation.",
     label: "Generate Cover",
     parameters: GenerateCoverParams,
     async execute(

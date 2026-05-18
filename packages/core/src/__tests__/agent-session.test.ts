@@ -472,6 +472,28 @@ describe("runAgentSession cache — bookId switch", () => {
     expect(agentInstances[0].state.tools.map((tool: any) => tool.name)).toEqual(["sub_agent", "short_fiction_run", "generate_cover"]);
   });
 
+  it("does not expose generic write/edit tools to active-book chat agents", async () => {
+    const model = { provider: "x", id: "y", api: "anthropic-messages" } as any;
+    const pipeline = {} as any;
+
+    await runAgentSession(
+      { sessionId: "s1", bookId: "book-a", language: "zh", pipeline, projectRoot, model },
+      "hi",
+    );
+
+    expect(agentInstances[0].state.tools.map((tool: any) => tool.name)).toEqual([
+      "sub_agent",
+      "short_fiction_run",
+      "generate_cover",
+      "read",
+      "write_truth_file",
+      "rename_entity",
+      "patch_chapter_text",
+      "grep",
+      "ls",
+    ]);
+  });
+
   it("把真实 Agent 的 message_end 写入 JSONL，并在 cache 失效后恢复 raw AgentMessage", async () => {
     const model = { provider: "anthropic", id: "fake", api: "anthropic-messages" } as any;
     const pipeline = {} as any;

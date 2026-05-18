@@ -247,6 +247,8 @@ describe("agent deterministic writing tools", () => {
     expect(tool.name).toBe("generate_cover");
     expect(schemaText).toContain("title");
     expect(schemaText).toContain("outputDir");
+    expect(schemaText).toContain("coverPrompt");
+    expect(toolText).toContain("revise the cover prompt");
     expect(schemaText).toContain("coverModel");
     expect(toolText).not.toContain("short_fiction_run");
   });
