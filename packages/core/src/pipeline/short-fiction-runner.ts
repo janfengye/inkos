@@ -199,13 +199,13 @@ export async function runShortFictionProduction(
 
   return {
     storyId,
-    outlinePath: join(baseDir, "outline", "v002.md"),
-    outlineReviewPath: join(baseDir, "reviews", "outline-v001.md"),
-    draftReviewPath: join(baseDir, "reviews", "draft-v001.md"),
-    finalMarkdownPath: join(baseDir, "final", "full.md"),
-    finalJsonPath: join(baseDir, "final", "short-story.json"),
-    salesPackagePath: join(baseDir, "final", "sales-package.md"),
-    coverPromptPath: join(baseDir, "final", "cover-prompt.md"),
+    outlinePath: projectPath(join(baseDir, "outline", "v002.md")),
+    outlineReviewPath: projectPath(join(baseDir, "reviews", "outline-v001.md")),
+    draftReviewPath: projectPath(join(baseDir, "reviews", "draft-v001.md")),
+    finalMarkdownPath: projectPath(join(baseDir, "final", "full.md")),
+    finalJsonPath: projectPath(join(baseDir, "final", "short-story.json")),
+    salesPackagePath: projectPath(join(baseDir, "final", "sales-package.md")),
+    coverPromptPath: projectPath(join(baseDir, "final", "cover-prompt.md")),
     coverImagePath: coverArtifacts.coverImagePath,
     coverError: coverArtifacts.coverError,
   };
@@ -243,8 +243,8 @@ export async function generateShortFictionCover(
 
   return {
     title,
-    outputDir,
-    coverPromptPath: promptPath,
+    outputDir: projectPath(outputDir),
+    coverPromptPath: projectPath(promptPath),
     coverImagePath: artifact.coverImagePath,
   };
 }
@@ -343,7 +343,7 @@ async function generateCoverImageArtifact(input: {
     const payload = await generateGeminiCover(request, prompt);
     const coverPath = join(input.outputDir, payload.extension === "jpg" ? "cover.jpg" : "cover.png");
     await writeBinary(input.root, coverPath, Buffer.from(payload.base64, "base64"));
-    return { coverImagePath: coverPath };
+    return { coverImagePath: projectPath(coverPath) };
   }
 
   if (request.api === "images") {
@@ -351,7 +351,7 @@ async function generateCoverImageArtifact(input: {
     const payload = await generateImagesCover(request, prompt, size);
     const coverPath = join(input.outputDir, payload.extension === "jpg" ? "cover.jpg" : "cover.png");
     await writeBinary(input.root, coverPath, payload.buffer);
-    return { coverImagePath: coverPath };
+    return { coverImagePath: projectPath(coverPath) };
   }
 
   const endpoint = request.endpoint ?? `${request.baseUrl.replace(/\/+$/u, "")}/responses`;
@@ -386,7 +386,7 @@ async function generateCoverImageArtifact(input: {
 
   const coverPath = join(input.outputDir, "cover.png");
   await writeBinary(input.root, coverPath, Buffer.from(imageBase64, "base64"));
-  return { coverImagePath: coverPath };
+  return { coverImagePath: projectPath(coverPath) };
 }
 
 export interface ShortFictionCoverRequest {
@@ -690,8 +690,13 @@ async function writeText(root: string, path: string, value: string): Promise<voi
 
 function normalizeOutputDir(value: string): string {
   const trimmed = value.trim() || "shorts";
-  safeChildPath("/", trimmed);
-  return trimmed.replace(/^\/+/u, "").replace(/\/+$/u, "") || "shorts";
+  const normalized = projectPath(trimmed).replace(/^\/+/u, "").replace(/\/+$/u, "") || "shorts";
+  safeChildPath("/", normalized);
+  return normalized;
+}
+
+function projectPath(value: string): string {
+  return value.replace(/\\/gu, "/");
 }
 
 function boundedInteger(value: number | undefined, fallback: number, name: string, min: number, max: number): number {

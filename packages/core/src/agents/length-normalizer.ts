@@ -51,7 +51,6 @@ export class LengthNormalizerAgent extends BaseAgent {
       ],
       {
         temperature: 0.2,
-        maxTokens: this.estimateMaxTokens(input.lengthSpec),
       },
     );
 
@@ -135,11 +134,6 @@ ${input.chapterContent}`;
     }
 
     return `Final count ${finalCount} is outside the soft range ${lengthSpec.softMin}-${lengthSpec.softMax} after one normalization pass.`;
-  }
-
-  private estimateMaxTokens(lengthSpec: LengthSpec): number {
-    const upperBound = Math.max(lengthSpec.hardMax, lengthSpec.softMax, lengthSpec.target);
-    return Math.max(1024, Math.ceil(upperBound * 1.5));
   }
 
   private sanitizeNormalizedContent(rawContent: string, fallbackContent: string): string {
