@@ -1,7 +1,7 @@
 ---
 name: inkos
 description: Local AI fiction creation system with Studio Chat, CLI, and TUI - use for long-form novel writing, standalone short-fiction packages, cover generation, open-world / branching interactive fiction, fan fiction, spinoffs, style imitation, chapter continuation/import, EPUB export, AIGC detection, and project analytics. Native English support with 10 built-in English genre profiles (LitRPG, Progression Fantasy, Isekai, Cultivation, System Apocalypse, Dungeon Core, Romantasy, Sci-Fi, Tower Climber, Cozy Fantasy). Also supports Chinese web novel genres (xuanhuan, xianxia, urban, horror, other). Includes governed context assembly, protected/compressible context budgeting, chapter planning, writing, audit/revision, persistent world/truth state, multi-model routing, cover/image services, custom OpenAI-compatible providers, and InkOS Studio web UI for visual book management, Short runs, Play worlds, cover generation, chapter review, market radar, and analytics.
-version: 2.3.4
+version: 2.4.0
 metadata: { "openclaw": { "emoji": "📖", "requires": { "bins": ["inkos", "node"], "env": ["OPENAI_API_KEY"] }, "primaryEnv": "OPENAI_API_KEY", "homepage": "https://github.com/Narcooo/inkos", "install": [{ "id": "npm", "kind": "node", "package": "@actalk/inkos", "label": "Install InkOS (npm)" }] } }
 ---
 
