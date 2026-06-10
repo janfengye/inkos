@@ -19,7 +19,7 @@
     <img alt="Kimi Open Source Friends" width="420" src="https://kimi-file.moonshot.cn/prod-chat-kimi/kfs/4/1/2026-06-05/1d8h69fudcmosb3pipls0">
   </picture>
   <br>
-  <sub>InkOS 成为首批 KIMI 开源合作伙伴</sub>
+  🎉🎉 InkOS 入选首批 KIMI 开源合作伙伴 🎉🎉
 </p>
 
 <p align="center">
@@ -624,6 +624,8 @@ pnpm typecheck    # 类型检查
 ## 致谢
 
 InkOS 的 agent 运行时构建在 [pi](https://github.com/badlogic/pi-mono)（`@mariozechner/pi-ai` 与 `@mariozechner/pi-agent-core`，作者 Mario Zechner）之上。感谢 pi 提供的扎实底座。
+
+本开源项目已链接并认可 [LINUX DO](https://linux.do/) 社区，感谢社区成员的反馈、测试与讨论。
 
 ## 许可证
 
