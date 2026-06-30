@@ -4,17 +4,13 @@ import { useColors } from "../hooks/use-colors";
 import type { Theme } from "../hooks/use-theme";
 import type { TFunction } from "../hooks/use-i18n";
 import type { StoryGraph, StoryNode } from "@actalk/inkos-core/interactive-film/graph-schema";
+import { AnalysisPanel } from "../components/film/AnalysisPanel";
 
 interface Nav {
   toDashboard: () => void;
   toPlay: (id: string) => void;
   toFlow: (id: string) => void;
   toFilmAuthor: (id: string) => void;
-}
-
-interface ValidationReport {
-  ok: boolean;
-  issues: { code: string; level: "error" | "warning" | "info"; message: string; nodeIds: string[] }[];
 }
 
 export function buildProjectExportDownloadUrl(projectId: string): string | null {
@@ -26,21 +22,22 @@ export function StoryGraphTree({
   nav,
   theme,
   t,
+  embedded = false,
 }: {
   projectId: string;
   nav: Nav;
   theme: Theme;
   t: TFunction;
+  embedded?: boolean;
 }) {
   const c = useColors(theme);
   const { data: graph, loading, error, refetch } = useApi<StoryGraph>(`/projects/${projectId}/story-graph`);
-  const { data: validation } = useApi<ValidationReport>(`/projects/${projectId}/story-graph/validation`);
   const [savingId, setSavingId] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [generatingId, setGeneratingId] = useState<string | null>(null);
 
   if (loading) return <div className={c.muted}>{t("common.loading")}</div>;
-  if (error) return <div className="text-red-400">{t("common.error")}: {error}</div>;
+  if (error) return <div className="text-destructive">{t("common.error")}: {error}</div>;
   if (!graph) return null;
   const exportUrl = buildProjectExportDownloadUrl(projectId);
 
@@ -48,7 +45,7 @@ export function StoryGraphTree({
     setGeneratingId(nodeId);
     setSaveError(null);
     try {
-      await fetchJson(`/projects/${projectId}/nodes/${nodeId}/image`, { method: "POST" });
+      await fetchJson(`/projects/${encodeURIComponent(projectId)}/nodes/${encodeURIComponent(nodeId)}/image`, { method: "POST" });
       await refetch();
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : String(err));
@@ -76,67 +73,51 @@ export function StoryGraphTree({
 
   return (
     <div className="space-y-6" data-testid="film-tree">
-      <div className="flex items-center gap-3 text-sm">
-        <button onClick={nav.toDashboard} className={c.link} data-testid="film-back">
-          ← {t("bread.books")}
-        </button>
-        <span className={c.muted}>/</span>
-        <span data-testid="film-title">{graph.title || projectId}</span>
-        <button
-          onClick={() => nav.toPlay(projectId)}
-          className={`ml-auto px-3 py-1 rounded ${c.btnPrimary}`}
-          data-testid="film-play"
-        >
-          试玩 →
-        </button>
-        <button
-          onClick={() => nav.toFlow(projectId)}
-          className={`px-3 py-1 rounded ${c.btnSecondary}`}
-          data-testid="open-flow"
-        >
-          流程图 →
-        </button>
-        <button
-          onClick={() => nav.toFilmAuthor(projectId)}
-          className={`px-3 py-1 rounded ${c.btnSecondary}`}
-          data-testid="open-authoring"
-        >
-          AI 对话创作 →
-        </button>
-        {exportUrl && (
-          <a
-            href={exportUrl}
-            download
-            className="px-3 py-1 rounded bg-slate-700 text-white"
-            data-testid="film-export-package"
+      {!embedded && (
+        <div className="flex items-center gap-3 text-sm">
+          <button onClick={nav.toDashboard} className={c.link} data-testid="film-back">
+            ← {t("bread.books")}
+          </button>
+          <span className={c.muted}>/</span>
+          <span data-testid="film-title">{graph.title || projectId}</span>
+          <button
+            onClick={() => nav.toPlay(projectId)}
+            className={`ml-auto px-3 py-1 rounded ${c.btnPrimary}`}
+            data-testid="film-play"
           >
-            导出整包
-          </a>
-        )}
-      </div>
-
-      {validation && (
-        <div className="border rounded p-3" data-testid="validation-panel">
-          <div className={`text-sm font-medium ${c.muted}`}>校验{validation.ok ? "" : "（有阻断问题）"}</div>
-          {validation.issues.length === 0 ? (
-            <div className={`text-sm ${c.muted}`}>无问题</div>
-          ) : (
-            <ul className="mt-1 space-y-1">
-              {validation.issues.map((issue, i) => (
-                <li key={i} data-testid={`validation-issue-${issue.code}`} className="text-xs flex gap-2">
-                  <span className={
-                    issue.level === "error" ? "text-red-500" : issue.level === "warning" ? "text-amber-500" : "text-slate-400"
-                  }>[{issue.level}]</span>
-                  <span>{issue.message}</span>
-                </li>
-              ))}
-            </ul>
+            试玩 →
+          </button>
+          <button
+            onClick={() => nav.toFlow(projectId)}
+            className={`px-3 py-1 rounded ${c.btnSecondary}`}
+            data-testid="open-flow"
+          >
+            流程图 →
+          </button>
+          <button
+            onClick={() => nav.toFilmAuthor(projectId)}
+            className={`px-3 py-1 rounded ${c.btnSecondary}`}
+            data-testid="open-authoring"
+          >
+            AI 对话创作 →
+          </button>
+          {exportUrl && (
+            <a
+              href={exportUrl}
+              download
+              className={`px-3 py-1 rounded ${c.btnSecondary}`}
+              data-testid="film-export-package"
+            >
+              导出整包
+            </a>
           )}
         </div>
       )}
 
+      <AnalysisPanel projectId={projectId} theme={theme} />
+
       {saveError && (
-        <div className="rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-2 text-sm text-red-400" data-testid="film-save-error">
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive" data-testid="film-save-error">
           保存失败：{saveError}
         </div>
       )}

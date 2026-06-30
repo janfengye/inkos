@@ -581,3 +581,15 @@ export {
   defaultNodeImageDeps,
   type NodeImageDeps,
 } from "./interactive-film/node-image.js";
+export {
+  enumerateRuntimePaths,
+  type RuntimePath,
+} from "./interactive-film/paths.js";
+export {
+  emotionScore,
+  nodeEmotion,
+  analyzeEmotionalArcs,
+  analyzePathDistribution,
+} from "./interactive-film/emotion.js";
+export { exportInk } from "./interactive-film/export-ink.js";
+export { buildPlayableHtml } from "./interactive-film/export-html.js";

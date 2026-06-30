@@ -80,6 +80,10 @@ import {
   applyGraphDelta,
   loadStoryGraph,
   reviewStoryGraph,
+  exportInk,
+  buildPlayableHtml,
+  analyzeEmotionalArcs,
+  analyzePathDistribution,
   generateNodeImage,
   defaultNodeImageDeps,
   type NodeImageDeps,
@@ -116,6 +120,11 @@ const PIPELINE_STAGES: Record<string, string[]> = {
   ],
   auditor: ["审计章节"],
 };
+
+function attachmentDisposition(fileName: string): string {
+  const safeAscii = fileName.replace(/[^A-Za-z0-9._-]+/g, "_") || "download";
+  return `attachment; filename="${safeAscii}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
+}
 
 const AGENT_LABELS: Record<string, string> = {
   architect: "建书", writer: "写作", auditor: "审计",
@@ -5157,6 +5166,27 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     return c.json(checks);
   });
 
+  app.get("/api/v1/interactive-films", async (c) => {
+    const filmsDir = join(root, "interactive-films");
+    let entries: string[] = [];
+    try {
+      const dirents = await readdir(filmsDir, { withFileTypes: true });
+      entries = dirents.filter((d) => d.isDirectory()).map((d) => d.name);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+    const films: Array<{ projectId: string; title: string }> = [];
+    for (const projectId of entries) {
+      if (!isSafeBookId(projectId)) continue;
+      try {
+        const graph = await loadStoryGraph(root, projectId);
+        if (graph) films.push({ projectId, title: graph.title || projectId });
+      } catch { /* skip dirs without valid story-graph */ }
+    }
+    films.sort((a, b) => a.title.localeCompare(b.title, "zh"));
+    return c.json({ films });
+  });
+
   app.post("/api/v1/projects/:id/story-graph/delta", async (c) => {
     const id = c.req.param("id");
     if (!isSafeBookId(id)) {
@@ -5217,6 +5247,65 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       return c.json({ error: { code: "NOT_FOUND", message: `story graph not found for ${id}` } }, 404);
     }
     return c.json(reviewStoryGraph(graph));
+  });
+
+  app.get("/api/v1/projects/:id/story-graph/analysis", async (c) => {
+    const id = c.req.param("id");
+    if (!isSafeBookId(id)) return c.json({ error: { code: "INVALID_ID", message: `invalid project id: ${id}` } }, 400);
+    const graph = await loadStoryGraph(root, id);
+    if (!graph) return c.json({ error: { code: "NOT_FOUND", message: `story graph not found for ${id}` } }, 404);
+    return c.json({ report: reviewStoryGraph(graph), arcs: analyzeEmotionalArcs(graph), distribution: analyzePathDistribution(graph) });
+  });
+
+  app.get("/api/v1/projects/:id/export/json", async (c) => {
+    const id = c.req.param("id");
+    if (!isSafeBookId(id)) return c.json({ error: { code: "INVALID_ID", message: `invalid project id: ${id}` } }, 400);
+    const graph = await loadStoryGraph(root, id);
+    if (!graph) return c.json({ error: { code: "NOT_FOUND", message: `story graph not found for ${id}` } }, 404);
+    return new Response(JSON.stringify(graph, null, 2), {
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Disposition": attachmentDisposition(`${id}.story-graph.json`),
+      },
+    });
+  });
+
+  app.get("/api/v1/projects/:id/export/ink", async (c) => {
+    const id = c.req.param("id");
+    if (!isSafeBookId(id)) return c.json({ error: { code: "INVALID_ID", message: `invalid project id: ${id}` } }, 400);
+    const graph = await loadStoryGraph(root, id);
+    if (!graph) return c.json({ error: { code: "NOT_FOUND", message: `story graph not found for ${id}` } }, 404);
+    return new Response(exportInk(graph), {
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Content-Disposition": attachmentDisposition(`${id}.ink`),
+      },
+    });
+  });
+
+  app.get("/api/v1/projects/:id/export/html", async (c) => {
+    const id = c.req.param("id");
+    if (!isSafeBookId(id)) return c.json({ error: { code: "INVALID_ID", message: `invalid project id: ${id}` } }, 400);
+    const graph = await loadStoryGraph(root, id);
+    if (!graph) return c.json({ error: { code: "NOT_FOUND", message: `story graph not found for ${id}` } }, 404);
+    const assetDataUris: Record<string, string> = {};
+    for (const node of graph.nodes) {
+      const ref = node.imageSlot?.assetRef;
+      if (!ref || assetDataUris[ref]) continue;
+      try {
+        const file = resolveProjectImageFile(root, ref);
+        const buf = await readFile(file.resolved);
+        assetDataUris[ref] = `data:${file.contentType};base64,${buf.toString("base64")}`;
+      } catch (err) {
+        console.warn(`[studio] export/html: skipping assetRef "${ref}" —`, err);
+      }
+    }
+    return new Response(buildPlayableHtml(graph, { assetDataUris }), {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Content-Disposition": attachmentDisposition(`${id}.html`),
+      },
+    });
   });
 
   app.post("/api/v1/projects/:id/nodes/:nodeId/image", async (c) => {

@@ -13,11 +13,13 @@ export function StoryPlayer({
   nav,
   theme,
   t,
+  embedded = false,
 }: {
   projectId: string;
   nav: Nav;
   theme: Theme;
   t: TFunction;
+  embedded?: boolean;
 }) {
   const c = useColors(theme);
   const { data: graph, loading, error } = useApi<StoryGraph>(`/projects/${projectId}/story-graph`);
@@ -40,13 +42,13 @@ export function StoryPlayer({
   }, [graph, startId]);
 
   if (loading) return <div className={c.muted}>{t("common.loading")}</div>;
-  if (error) return <div className="text-red-400">{t("common.error")}: {error}</div>;
+  if (error) return <div className="text-destructive">{t("common.error")}: {error}</div>;
   if (!graph) return null;
 
   if (!started || !currentId) {
     return (
       <div className="space-y-6" data-testid="player-start-screen">
-        <button onClick={nav.toDashboard} className={c.link} data-testid="player-back">← {t("bread.books")}</button>
+        {!embedded && <button onClick={nav.toDashboard} className={c.link} data-testid="player-back">← {t("bread.books")}</button>}
         <h1 className="text-2xl font-semibold">{graph.title}</h1>
         <button
           onClick={reset}
@@ -58,7 +60,7 @@ export function StoryPlayer({
   }
 
   const node = graph.nodes.find((n) => n.id === currentId);
-  if (!node) return <div className="text-red-400">节点缺失：{currentId}</div>;
+  if (!node) return <div className="text-destructive">节点缺失：{currentId}</div>;
 
   const isEnding = node.type === "ending";
   const choices = visibleChoices(node, vars);
@@ -74,7 +76,7 @@ export function StoryPlayer({
 
   return (
     <div className="space-y-6 relative" data-testid="player-screen">
-      <button onClick={nav.toDashboard} className={c.link} data-testid="player-back">← {t("bread.books")}</button>
+      {!embedded && <button onClick={nav.toDashboard} className={c.link} data-testid="player-back">← {t("bread.books")}</button>}
       <h2 className="text-xl font-medium" data-testid="player-node-title">{node.title}</h2>
 
       {node.imageSlot?.assetRef && (
@@ -93,7 +95,7 @@ export function StoryPlayer({
         <div className="space-y-3">
           {node.dialogue.map((line, i) => (
             <div key={i}>
-              <div className="text-amber-600 text-xs uppercase tracking-wider">{line.speaker}</div>
+              <div className="text-primary text-xs uppercase tracking-wider">{line.speaker}</div>
               <div className="text-sm">{line.text}</div>
             </div>
           ))}
@@ -102,7 +104,7 @@ export function StoryPlayer({
 
       {isEnding ? (
         <div className="border rounded-xl p-8 text-center space-y-4" data-testid="player-ending">
-          <div className="text-xs uppercase tracking-widest text-amber-600" data-testid="player-ending-type">
+          <div className="text-xs uppercase tracking-widest text-primary" data-testid="player-ending-type">
             {graph.endings.find((e) => e.nodeId === node.id)?.type ?? "ending"}
           </div>
           <div className="text-lg" data-testid="player-ending-title">
@@ -127,16 +129,16 @@ export function StoryPlayer({
               {choice.text}
             </button>
           ))}
-          {choices.length === 0 && <div className="text-red-400" data-testid="player-deadend">此路不通</div>}
+          {choices.length === 0 && <div className="text-destructive" data-testid="player-deadend">此路不通</div>}
         </div>
       )}
 
       {graph.variables.length > 0 && (
-        <div className="fixed bottom-6 right-6 border rounded-lg px-4 py-3 bg-white/90 space-y-1" data-testid="player-hud">
+        <div className="fixed bottom-6 right-6 border border-border rounded-lg px-4 py-3 bg-card/95 backdrop-blur-sm shadow-lg space-y-1" data-testid="player-hud">
           {graph.variables.map((v) => (
             <div key={v.name} className="flex justify-between gap-4 text-xs">
               <span className={c.muted}>{v.name}</span>
-              <span className="font-mono text-amber-600" data-testid={`hud-${v.name}`}>
+              <span className="font-mono text-primary" data-testid={`hud-${v.name}`}>
                 {String(vars[v.name] ?? v.default)}
               </span>
             </div>
