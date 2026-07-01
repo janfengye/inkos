@@ -52,6 +52,7 @@ import type { TranscriptEvent, TranscriptRole } from "../interaction/session-tra
 import type { PlayMode, SessionKind } from "../interaction/session.js";
 import type { ActionPayload, ActionSource, RequestedIntent } from "../interaction/action-envelope.js";
 import type { ContextCompressionCallback } from "../models/context-compression.js";
+import { createSkillRegistry, loadConfiguredCapabilitySkills } from "../skills/index.js";
 import { assertSafeBookId } from "../utils/book-id.js";
 import { PlayStore } from "../play/play-store.js";
 import { isLlmStubEnabled, stubAgentStream } from "./llm-stub.js";
@@ -75,6 +76,10 @@ export interface AgentSessionConfig {
   requestedIntent?: RequestedIntent;
   /** Structured execution arguments confirmed by the UI/command surface. */
   actionPayload?: ActionPayload;
+  /** User/UI-forced capability skills for this turn, e.g. @open-world-play. */
+  requestedSkills?: ReadonlyArray<string>;
+  /** Capability skills explicitly disabled for this turn. */
+  disabledSkills?: ReadonlyArray<string>;
   /** Language for the system prompt. */
   language: string;
   /** PipelineRunner for sub-agent tool delegation. */
@@ -115,6 +120,7 @@ interface CachedAgent {
   actionSource: NonNullable<AgentSessionConfig["actionSource"]>;
   requestedIntent: AgentSessionConfig["requestedIntent"];
   actionPayloadKey: string;
+  skillResolutionKey: string;
   playWorldExists: boolean;
   language: string;
   modelIdentity: string;
@@ -200,6 +206,32 @@ function agentModelIdentity(model: Model<Api>): string {
 
 function actionPayloadCacheKey(payload: ActionPayload | undefined): string {
   return payload ? JSON.stringify(payload) : "";
+}
+
+function skillResolutionCacheKey(value: {
+  readonly usedSkills: ReadonlyArray<{
+    readonly id: string;
+    readonly source?: string;
+    readonly whenToUse?: string;
+    readonly promptPacks?: ReadonlyArray<string>;
+    readonly body?: string;
+  }>;
+  readonly forcedSkillIds: ReadonlyArray<string>;
+  readonly missingSkillIds: ReadonlyArray<string>;
+  readonly disabledSkillIds: ReadonlyArray<string>;
+}): string {
+  return JSON.stringify({
+    used: value.usedSkills.map((skill) => ({
+      id: skill.id,
+      source: skill.source,
+      whenToUse: skill.whenToUse,
+      promptPacks: skill.promptPacks ?? [],
+      body: skill.body ?? "",
+    })),
+    forced: value.forcedSkillIds,
+    missing: value.missingSkillIds,
+    disabled: value.disabledSkillIds,
+  });
 }
 
 function sessionQueueKey(projectRoot: string, sessionId: string): string {
@@ -788,6 +820,14 @@ async function runAgentSessionUnlocked(
   const requestedIntent = config.requestedIntent;
   const actionPayload = config.actionPayload;
   const actionPayloadKey = actionPayloadCacheKey(actionPayload);
+  const configuredSkills = await loadConfiguredCapabilitySkills({ projectRoot });
+  const skillResolution = createSkillRegistry({ skills: configuredSkills.skills }).resolveSkills({
+    requestedSkills: config.requestedSkills,
+    disabledSkills: config.disabledSkills,
+    sessionKind,
+    instruction: userMessage,
+  });
+  const skillResolutionKey = skillResolutionCacheKey(skillResolution);
   const model = resolveModel(config.model);
   const requestedModelIdentity = agentModelIdentity(model);
   const allowSystemFileRead = config.allowSystemFileRead ?? envFlagEnabled(process.env.INKOS_AGENT_ALLOW_SYSTEM_READ, false);
@@ -813,6 +853,7 @@ async function runAgentSessionUnlocked(
     const actionSourceChanged = cached.actionSource !== actionSource;
     const requestedIntentChanged = cached.requestedIntent !== requestedIntent;
     const actionPayloadChanged = cached.actionPayloadKey !== actionPayloadKey;
+    const skillResolutionChanged = cached.skillResolutionKey !== skillResolutionKey;
     const languageChanged = cached.language !== language;
     const apiKeyChanged = cached.apiKey !== config.apiKey;
     const readPermissionChanged = cached.allowSystemFileRead !== allowSystemFileRead;
@@ -827,6 +868,7 @@ async function runAgentSessionUnlocked(
       actionSourceChanged ||
       requestedIntentChanged ||
       actionPayloadChanged ||
+      skillResolutionChanged ||
       languageChanged ||
       apiKeyChanged ||
       readPermissionChanged ||
@@ -868,7 +910,12 @@ async function runAgentSessionUnlocked(
     const agent = new Agent({
       initialState: {
         model,
-        systemPrompt: buildAgentSystemPrompt(bookId, language, sessionKind, { actionSource, requestedIntent, playWorldExists }),
+        systemPrompt: buildAgentSystemPrompt(bookId, language, sessionKind, {
+          actionSource,
+          requestedIntent,
+          playWorldExists,
+          skills: skillResolution,
+        }),
         tools: createAgentToolsForMode({
           pipeline,
           bookId,
@@ -913,6 +960,7 @@ async function runAgentSessionUnlocked(
       actionSource,
       requestedIntent,
       actionPayloadKey,
+      skillResolutionKey,
       playWorldExists,
       language,
       modelIdentity: requestedModelIdentity,
