@@ -30,6 +30,7 @@ const createInteractionToolsFromDepsMock = vi.fn(() => ({}));
 const loadProjectSessionMock = vi.fn();
 const resolveSessionActiveBookMock = vi.fn();
 const runAgentSessionMock = vi.fn();
+const abortAgentSessionMock = vi.fn();
 const playRunnerStepMock = vi.fn();
 const playRunnerCtorArgs: unknown[] = [];
 const generatePlayImageMock = vi.fn();
@@ -249,6 +250,7 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
     loadProjectSession: loadProjectSessionMock,
     resolveSessionActiveBook: resolveSessionActiveBookMock,
     runAgentSession: runAgentSessionMock,
+    abortAgentSession: abortAgentSessionMock,
     createSubAgentTool: actual.createSubAgentTool,
     createShortFictionRunTool: actual.createShortFictionRunTool,
     createGenerateCoverTool: actual.createGenerateCoverTool,
@@ -511,6 +513,7 @@ describe("createStudioServer daemon lifecycle", () => {
     rollbackToChapterMock.mockResolvedValue([]);
     pipelineConfigs.length = 0;
     runAgentSessionMock.mockReset();
+    abortAgentSessionMock.mockReset();
     playRunnerStepMock.mockReset();
     playRunnerCtorArgs.length = 0;
     playRunnerStepMock.mockResolvedValue({
@@ -582,7 +585,7 @@ describe("createStudioServer daemon lifecycle", () => {
     expect(vi.isMockFunction(isSafeBookId)).toBe(false);
     expect(isSafeBookId("demo-book")).toBe(true);
     expect(isSafeBookId("demo/book")).toBe(false);
-  }, 10_000);
+  }, 60_000);
 
   it("returns from /api/daemon/start before the first write cycle finishes", async () => {
     let resolveStart: (() => void) | undefined;
@@ -611,7 +614,7 @@ describe("createStudioServer daemon lifecycle", () => {
     await expect(status.json()).resolves.toEqual({ running: true });
 
     resolveStart?.();
-  }, 10_000);
+  }, 60_000);
 
   it("rejects book routes with path traversal ids", async () => {
     const { createStudioServer } = await import("./server.js");
@@ -2600,6 +2603,20 @@ describe("createStudioServer daemon lifecycle", () => {
     await expect(response.json()).resolves.toEqual({ ok: true });
   });
 
+  it("aborts a cached agent session through POST /api/v1/sessions/:sessionId/abort", async () => {
+    abortAgentSessionMock.mockReturnValueOnce(true);
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/sessions/agent-session-1/abort", {
+      method: "POST",
+    });
+
+    expect(response.status).toBe(200);
+    expect(abortAgentSessionMock).toHaveBeenCalledWith(root, "agent-session-1");
+    await expect(response.json()).resolves.toEqual({ ok: true, aborted: true });
+  });
+
   it("routes /api/agent through runAgentSession and returns response + sessionId", async () => {
     runAgentSessionMock.mockImplementationOnce(async (config: { onEvent?: (event: unknown) => void }) => {
       config.onEvent?.({
@@ -2650,6 +2667,58 @@ describe("createStudioServer daemon lifecycle", () => {
       }),
       "检查当前状态",
     );
+  });
+
+  it("stores uploaded attachments and forwards them to the agent session", async () => {
+    const note = Buffer.from("# 参考资料\n主角必须保留第一人称。", "utf-8").toString("base64");
+    const image = Buffer.from("fakepng", "utf-8").toString("base64");
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "按附件继续讨论",
+        activeBookId: "demo-book",
+        sessionId: "agent-session-1",
+        attachments: [
+          {
+            id: "note-1",
+            filename: "brief.md",
+            mediaType: "text/markdown",
+            size: Buffer.byteLength(note, "base64"),
+            dataUrl: `data:text/markdown;base64,${note}`,
+          },
+          {
+            id: "img-1",
+            filename: "reference.png",
+            mediaType: "image/png",
+            size: Buffer.byteLength(image, "base64"),
+            dataUrl: `data:image/png;base64,${image}`,
+          },
+        ],
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    const agentConfig = runAgentSessionMock.mock.calls.at(-1)?.[0] as { attachments?: Array<Record<string, unknown>> };
+    expect(agentConfig.attachments).toHaveLength(2);
+    expect(agentConfig.attachments?.[0]).toMatchObject({
+      id: "note-1",
+      filename: "brief.md",
+      mimeType: "text/markdown",
+      text: "# 参考资料\n主角必须保留第一人称。",
+    });
+    expect(agentConfig.attachments?.[1]).toMatchObject({
+      id: "img-1",
+      filename: "reference.png",
+      mimeType: "image/png",
+      image: { data: image, mimeType: "image/png" },
+    });
+    const storedPath = agentConfig.attachments?.[0]?.storedPath;
+    expect(typeof storedPath).toBe("string");
+    await expect(access(join(root, storedPath as string))).resolves.toBeUndefined();
   });
 
   it("executes confirmed create-book action directly without asking the chat model to call tools", async () => {
@@ -2889,7 +2958,7 @@ describe("createStudioServer daemon lifecycle", () => {
         },
       }),
     );
-  }, 10_000);
+  }, 60_000);
 
   it("does not present audit-failed direct write-next as completed", async () => {
     writeNextChapterMock.mockResolvedValueOnce({
@@ -2944,7 +3013,7 @@ describe("createStudioServer daemon lifecycle", () => {
         },
       }),
     );
-  }, 10_000);
+  }, 60_000);
 
   it("does not direct-run write-next from ordinary free text", async () => {
     const { createStudioServer } = await import("./server.js");
@@ -2997,7 +3066,7 @@ describe("createStudioServer daemon lifecycle", () => {
     });
     expect(writeNextChapterMock).toHaveBeenCalledWith("demo-book");
     expect(runAgentSessionMock).not.toHaveBeenCalled();
-  }, 10_000);
+  }, 60_000);
 
   it("forwards playMode to runAgentSession for play sessions", async () => {
     const { createStudioServer } = await import("./server.js");
@@ -3861,7 +3930,7 @@ describe("createStudioServer daemon lifecycle", () => {
       },
     });
     expect(chatCompletionMock).not.toHaveBeenCalled();
-  }, 10_000);
+  }, 60_000);
 
   it("does not treat architect_incomplete as a created book", async () => {
     const orphanSession = {

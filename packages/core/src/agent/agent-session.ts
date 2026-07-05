@@ -8,6 +8,7 @@ import type {
   AssistantMessage,
   AssistantMessageEventStream,
   Context as PiContext,
+  ImageContent,
   Message,
   SimpleStreamOptions,
   ToolResultMessage,
@@ -36,6 +37,8 @@ import {
   createStoryboardCreationTool,
   createInteractiveFilmCreationTool,
   createResearchWebTool,
+  createIngestMaterialTool,
+  createRetrieveMaterialTool,
 } from "./agent-tools.js";
 import { createFilmAuthoringTools, filmLLMDepsFromClient } from "./film-authoring-tools.js";
 import { createBookContextTransform } from "./context-transform.js";
@@ -97,6 +100,8 @@ export interface AgentSessionConfig {
   onEvent?: (event: AgentEvent) => void;
   /** Optional listener for context compression lifecycle events. */
   onContextCompression?: ContextCompressionCallback;
+  /** Attachments uploaded with this user turn. Text is injected as protected user context; images use pi-ai ImageContent. */
+  attachments?: ReadonlyArray<AgentSessionAttachment>;
 }
 
 export interface AgentSessionResult {
@@ -106,6 +111,19 @@ export interface AgentSessionResult {
   messages: AgentMessage[];
   /** Upstream model error surfaced by pi-agent-core, if the final assistant turn failed. */
   errorMessage?: string;
+}
+
+export interface AgentSessionAttachment {
+  readonly id: string;
+  readonly filename: string;
+  readonly mimeType: string;
+  readonly size: number;
+  readonly storedPath?: string;
+  readonly text?: string;
+  readonly image?: {
+    readonly data: string;
+    readonly mimeType: string;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +259,46 @@ function sessionQueueKey(projectRoot: string, sessionId: string): string {
 
 function agentCacheKey(projectRoot: string, sessionId: string): string {
   return sessionQueueKey(projectRoot, sessionId);
+}
+
+function buildAttachmentUserBlock(attachments: ReadonlyArray<AgentSessionAttachment> | undefined, language: string): string {
+  if (!attachments?.length) return "";
+  const isEn = language === "en";
+  const lines = [
+    isEn
+      ? "\n\n## Uploaded Files (host-provided, user-authorized)"
+      : "\n\n## 用户上传文件（宿主已接收，用户授权本轮使用）",
+  ];
+  for (const attachment of attachments) {
+    lines.push(`\n### ${attachment.filename}`);
+    lines.push(`- id: ${attachment.id}`);
+    lines.push(`- mime: ${attachment.mimeType || "application/octet-stream"}`);
+    lines.push(`- size: ${attachment.size}`);
+    if (attachment.storedPath) lines.push(`- stored_path: ${attachment.storedPath}`);
+    if (attachment.text) {
+      lines.push(isEn ? "\nContent:" : "\n内容：");
+      lines.push("```");
+      lines.push(attachment.text);
+      lines.push("```");
+    } else if (attachment.image) {
+      lines.push(isEn ? "- image: attached as multimodal input" : "- 图片：已作为多模态输入附加");
+    } else {
+      lines.push(isEn
+        ? "- content: stored only; no extractor is available for this MIME type yet"
+        : "- 内容：已保存；当前 MIME 类型暂未配置文本抽取器");
+    }
+  }
+  return lines.join("\n");
+}
+
+function attachmentImages(attachments: ReadonlyArray<AgentSessionAttachment> | undefined): ImageContent[] {
+  return (attachments ?? [])
+    .filter((attachment) => attachment.image)
+    .map((attachment) => ({
+      type: "image",
+      data: attachment.image!.data,
+      mimeType: attachment.image!.mimeType,
+    }));
 }
 
 function guardedStreamSimple<TApi extends Api>(
@@ -442,13 +500,29 @@ function extractTextFromAssistant(msg: AssistantMessage): string {
 function looksLikeUnsavedChapterProse(text: string): boolean {
   const trimmed = text.trim();
   if (trimmed.length < 800) return false;
+  if (looksLikeChapterRevisionPlan(trimmed)) return false;
   return /(^|\n)\s{0,3}#{1,3}\s*(?:第\s*[0-9一二三四五六七八九十百千]+\s*章|Chapter\s+\d+)/i.test(trimmed);
+}
+
+function looksLikeChapterRevisionPlan(text: string): boolean {
+  const headingLines = text
+    .split(/\n+/)
+    .filter((line) => /^\s{0,3}#{1,3}\s*(?:第\s*[0-9一二三四五六七八九十百千]+\s*章|Chapter\s+\d+)/i.test(line))
+    .slice(0, 8);
+  if (headingLines.length === 0) return false;
+  const planSignals = [
+    /修改指令|修订指令|重写指令|执行指令|改稿指令|具体修改|修改方案|修订方案|重写方案/,
+    /问题|目标|处理方式|调整|建议|要求|保留|删除|新增|强化|弱化/,
+    /revision brief|revision plan|rewrite plan|edit instruction|actionable instruction|change request/i,
+  ];
+  return headingLines.some((line) => planSignals.some((signal) => signal.test(line)))
+    || planSignals.some((signal) => signal.test(text.slice(0, 1200)));
 }
 
 function bookRawChapterBoundaryText(language: string): string {
   return language === "zh"
-    ? "这次模型输出了章节正文样式的聊天文本，但没有落盘。写下一章必须调用 sub_agent(agent=\"writer\")，由写作管线生成并保存章节。请重新发送“继续写下一章”，系统会走 writer 工具。"
-    : "The model produced chapter-like prose in chat, but nothing was saved. Writing the next chapter must call sub_agent(agent=\"writer\") so the writing pipeline generates and persists it. Please ask to continue again and the system will use the writer tool.";
+    ? "这次模型输出了疑似章节正文的聊天文本，但没有调用落盘工具。InkOS 不会把聊天正文当成已保存章节：如果要续写新章，请发送“继续写下一章”；如果要修改旧章，请发送“重写/修订第 N 章 + 具体要求”，系统会走 reviser/writer 管线落盘。"
+    : "The model produced chapter-like prose in chat without calling a persistence tool. InkOS will not treat chat prose as a saved chapter. Ask to write the next chapter only when you want to append; ask to rewrite/revise chapter N with concrete requirements when you want to change existing chapters.";
 }
 
 function replaceAssistantText(message: AssistantMessage, text: string): void {
@@ -681,6 +755,8 @@ function createAgentToolsForMode(params: {
     sameSession: params.sessionKind !== "chat",
   });
   const researchTool = createResearchWebTool(params.projectRoot);
+  const materialTool = createIngestMaterialTool(params.projectRoot);
+  const materialRetrievalTool = createRetrieveMaterialTool(params.projectRoot);
   const isConfirmed = (
     intent: NonNullable<AgentSessionConfig["requestedIntent"]>,
   ): boolean => {
@@ -689,7 +765,7 @@ function createAgentToolsForMode(params: {
   };
 
   if (params.sessionKind === "chat") {
-    return [proposalTool, researchTool];
+    return [proposalTool, researchTool, materialTool, materialRetrievalTool];
   }
 
   if (params.sessionKind === "short") {
@@ -699,28 +775,28 @@ function createAgentToolsForMode(params: {
     if (isConfirmed("generate_cover")) {
       return [createGenerateCoverTool(params.projectRoot, { actionPayload: params.actionPayload })];
     }
-    return [proposalTool];
+    return [proposalTool, materialTool, materialRetrievalTool];
   }
 
   if (params.sessionKind === "script") {
     if (isConfirmed("script_create")) {
       return [createScriptCreationTool(params.pipeline, params.projectRoot, { actionPayload: params.actionPayload })];
     }
-    return [proposalTool];
+    return [proposalTool, materialTool, materialRetrievalTool];
   }
 
   if (params.sessionKind === "storyboard") {
     if (isConfirmed("storyboard_create")) {
       return [createStoryboardCreationTool(params.pipeline, params.projectRoot, { actionPayload: params.actionPayload })];
     }
-    return [proposalTool];
+    return [proposalTool, materialTool, materialRetrievalTool];
   }
 
   if (params.sessionKind === "interactive-film") {
     if (isConfirmed("interactive_film_create")) {
       return [createInteractiveFilmCreationTool(params.pipeline, params.projectRoot, { actionPayload: params.actionPayload })];
     }
-    return [proposalTool];
+    return [proposalTool, materialTool, materialRetrievalTool];
   }
 
   if (params.sessionKind === "interactive-film-authoring") {
@@ -749,9 +825,11 @@ function createAgentToolsForMode(params: {
         createPlayEditTool(params.projectRoot, params.sessionId),
         createPlayReviseTool(params.pipeline, params.projectRoot, params.sessionId),
         createPlayStepTool(params.pipeline, params.projectRoot, params.sessionId),
+        materialTool,
+        materialRetrievalTool,
       ];
     }
-    return [proposalTool];
+    return [proposalTool, materialTool, materialRetrievalTool];
   }
 
   if (params.sessionKind === "book-create" && !params.bookId) {
@@ -761,7 +839,7 @@ function createAgentToolsForMode(params: {
         architectCreateOnly: true,
       })];
     }
-    return [proposalTool, researchTool];
+    return [proposalTool, researchTool, materialTool, materialRetrievalTool];
   }
 
   if (!params.bookId) {
@@ -777,6 +855,8 @@ function createAgentToolsForMode(params: {
     createPatchChapterTextTool(params.pipeline, params.projectRoot, params.bookId),
     createReplaceChapterTextTool(params.pipeline, params.projectRoot, params.bookId),
     researchTool,
+    materialTool,
+    materialRetrievalTool,
     createGrepTool(params.projectRoot),
     createLsTool(params.projectRoot),
   ];
@@ -978,6 +1058,9 @@ async function runAgentSessionUnlocked(
 
   cached.lastActive = Date.now();
   const { agent } = cached;
+  const attachmentBlock = buildAttachmentUserBlock(config.attachments, language);
+  const promptMessage = attachmentBlock ? `${userMessage}${attachmentBlock}` : userMessage;
+  const promptImages = attachmentImages(config.attachments);
 
   // ----- Prepare transcript persistence -----
   const requestId = randomUUID();
@@ -990,7 +1073,7 @@ async function runAgentSessionUnlocked(
     seq,
     timestamp: Date.now(),
     sessionKind,
-    input: userMessage,
+    input: promptMessage,
   }));
 
   let parentUuid: string | null = null;
@@ -1059,7 +1142,11 @@ async function runAgentSessionUnlocked(
   let errorMessage: string | undefined;
 
   try {
-    await agent.prompt(userMessage);
+    if (promptImages.length > 0) {
+      await agent.prompt(promptMessage, promptImages);
+    } else {
+      await agent.prompt(promptMessage);
+    }
 
     finalAssistant = lastAssistantMessage(agent.state.messages);
     errorMessage = assistantErrorMessage(finalAssistant);
@@ -1128,4 +1215,17 @@ export function evictAgentCache(sessionId: string): boolean {
     deleted = true;
   }
   return deleted;
+}
+
+/** Abort an active cached pi-agent session and evict it from cache. */
+export function abortAgentSession(projectRoot: string, sessionId: string): boolean {
+  let aborted = false;
+  for (const [key, entry] of agentCache) {
+    if (entry.projectRoot !== projectRoot || entry.sessionId !== sessionId) continue;
+    entry.agent.abort();
+    entry.agent.clearAllQueues?.();
+    agentCache.delete(key);
+    aborted = true;
+  }
+  return aborted;
 }

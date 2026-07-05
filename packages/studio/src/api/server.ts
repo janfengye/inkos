@@ -22,6 +22,7 @@ import {
   deleteBookSession,
   migrateBookSession,
   SessionAlreadyMigratedError,
+  abortAgentSession,
   runAgentSession,
   resolveServicePreset,
   resolveServiceProviderFamily,
@@ -69,8 +70,14 @@ import {
   createSkillRegistry,
   loadConfiguredCapabilitySkills,
   CapabilitySkillManifestSchema,
+  getBuiltinPrompt,
+  listBuiltinPromptPacks,
+  listBuiltinPrompts,
+  loadPromptPackPrompt,
+  promptOverridePath,
   type ActionPayload,
   type ActionSource,
+  type BuiltinPrompt,
   type CapabilitySkillManifest,
   createGenerateCoverTool,
   createInteractiveFilmCreationTool,
@@ -101,6 +108,7 @@ import {
   type LogEntry,
   type RequestedIntent,
   type SessionKind,
+  type AgentSessionAttachment,
 } from "@actalk/inkos-core";
 import { access, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -483,6 +491,126 @@ function normalizeStudioSkillId(value: unknown, field = "skillId"): string {
   return id;
 }
 
+type StudioAgentAttachmentPayload = {
+  readonly id?: string;
+  readonly filename?: string;
+  readonly mediaType?: string;
+  readonly size?: number;
+  readonly dataUrl?: string;
+};
+
+const MAX_AGENT_ATTACHMENTS = 8;
+const MAX_AGENT_ATTACHMENT_BYTES = 4 * 1024 * 1024;
+const MAX_AGENT_ATTACHMENT_TEXT_CHARS = 120_000;
+
+function safeUploadFileName(value: string): string {
+  const trimmed = value.trim().replace(/[/\\\0]/g, "_").replace(/\s+/g, " ");
+  const safe = trimmed.replace(/[^\p{L}\p{N}._ -]+/gu, "_").slice(0, 120).trim();
+  return safe || "upload";
+}
+
+function isTextAttachment(filename: string, mimeType: string): boolean {
+  const lower = filename.toLowerCase();
+  return mimeType.startsWith("text/")
+    || [
+      ".txt",
+      ".md",
+      ".markdown",
+      ".json",
+      ".csv",
+      ".tsv",
+      ".yaml",
+      ".yml",
+      ".log",
+    ].some((suffix) => lower.endsWith(suffix));
+}
+
+function parseDataUrl(dataUrl: string): { mimeType: string; buffer: Buffer } {
+  const match = /^data:([^;,]+)?(?:;[^,]*)?;base64,(.*)$/s.exec(dataUrl);
+  if (!match) {
+    throw new ApiError(400, "INVALID_ATTACHMENT_DATA_URL", "Attachment must be a base64 data URL");
+  }
+  const mimeType = match[1]?.trim() || "application/octet-stream";
+  return { mimeType, buffer: Buffer.from(match[2] ?? "", "base64") };
+}
+
+async function normalizeAgentAttachments(
+  root: string,
+  sessionId: string,
+  value: unknown,
+): Promise<AgentSessionAttachment[]> {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw new ApiError(400, "INVALID_ATTACHMENTS", "attachments must be an array");
+  }
+  if (value.length > MAX_AGENT_ATTACHMENTS) {
+    throw new ApiError(413, "TOO_MANY_ATTACHMENTS", `At most ${MAX_AGENT_ATTACHMENTS} files can be attached to one message`);
+  }
+
+  const uploadDir = join(root, ".inkos", "uploads", safeUploadFileName(sessionId));
+  const out: AgentSessionAttachment[] = [];
+  for (const [index, raw] of value.entries()) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new ApiError(400, "INVALID_ATTACHMENT", "Each attachment must be an object");
+    }
+    const payload = raw as StudioAgentAttachmentPayload;
+    const filename = safeUploadFileName(payload.filename || `upload-${index + 1}`);
+    if (!payload.dataUrl) {
+      throw new ApiError(400, "INVALID_ATTACHMENT", `Attachment ${filename} is missing dataUrl`);
+    }
+    const parsed = parseDataUrl(payload.dataUrl);
+    const mimeType = payload.mediaType?.trim() || parsed.mimeType;
+    if (parsed.buffer.byteLength > MAX_AGENT_ATTACHMENT_BYTES) {
+      throw new ApiError(413, "ATTACHMENT_TOO_LARGE", `${filename} exceeds ${MAX_AGENT_ATTACHMENT_BYTES} bytes`);
+    }
+    await mkdir(uploadDir, { recursive: true });
+    const storedName = `${Date.now()}-${index + 1}-${filename}`;
+    const storedPath = join(uploadDir, storedName);
+    await writeFile(storedPath, parsed.buffer);
+    const relPath = relative(root, storedPath);
+
+    if (mimeType.startsWith("image/")) {
+      out.push({
+        id: payload.id || `${Date.now()}-${index}`,
+        filename,
+        mimeType,
+        size: parsed.buffer.byteLength,
+        storedPath: relPath,
+        image: {
+          data: parsed.buffer.toString("base64"),
+          mimeType,
+        },
+      });
+      continue;
+    }
+
+    if (isTextAttachment(filename, mimeType)) {
+      const text = parsed.buffer.toString("utf-8");
+      if (text.length > MAX_AGENT_ATTACHMENT_TEXT_CHARS) {
+        throw new ApiError(413, "ATTACHMENT_TEXT_TOO_LARGE", `${filename} is too large to inject without semantic compaction`);
+      }
+      out.push({
+        id: payload.id || `${Date.now()}-${index}`,
+        filename,
+        mimeType,
+        size: parsed.buffer.byteLength,
+        storedPath: relPath,
+        text,
+      });
+      continue;
+    }
+
+    out.push({
+      id: payload.id || `${Date.now()}-${index}`,
+      filename,
+      mimeType,
+      size: parsed.buffer.byteLength,
+      storedPath: relPath,
+    });
+  }
+  return out;
+}
+
 function projectSkillsDir(root: string): string {
   return join(root, ".inkos", "skills");
 }
@@ -581,6 +709,29 @@ async function loadStudioSkills(root: string) {
     skills: registry.listSkills().map((skill) => toStudioSkill(skill, root, projectSkillIds)),
     diagnostics: configured.diagnostics,
   };
+}
+
+async function toStudioPromptPackPrompt(root: string, prompt: BuiltinPrompt) {
+  const loaded = await loadPromptPackPrompt({ promptId: prompt.id, projectRoot: root });
+  const overridePath = promptOverridePath(root, prompt.id);
+  return {
+    id: prompt.id,
+    packId: prompt.packId,
+    title: prompt.title,
+    defaultContent: prompt.content,
+    content: loaded.content,
+    source: loaded.source,
+    overridden: loaded.source === "project",
+    path: loaded.source === "project" ? relative(root, overridePath) : undefined,
+  };
+}
+
+function normalizeStudioPromptId(value: unknown): string {
+  const promptId = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (!promptId || !getBuiltinPrompt(promptId)) {
+    throw new ApiError(404, "PROMPT_PACK_PROMPT_NOT_FOUND", `Prompt pack prompt not found: ${String(value)}`);
+  }
+  return promptId;
 }
 
 async function listProjectSkillIds(root: string): Promise<Set<string>> {
@@ -3138,6 +3289,43 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     return c.json(result);
   });
 
+  app.get("/api/v1/prompt-packs", async (c) => {
+    const prompts = await Promise.all(
+      listBuiltinPrompts().map((prompt) => toStudioPromptPackPrompt(root, prompt)),
+    );
+    return c.json({
+      packs: listBuiltinPromptPacks(),
+      prompts,
+    });
+  });
+
+  app.put("/api/v1/prompt-packs/:promptId", async (c) => {
+    const promptId = normalizeStudioPromptId(c.req.param("promptId"));
+    const payload = await c.req.json().catch(() => {
+      throw new ApiError(400, "INVALID_PROMPT_PACK_PAYLOAD", "Prompt pack payload must be JSON");
+    });
+    const content = payload && typeof payload === "object" && "content" in payload
+      ? (payload as { readonly content?: unknown }).content
+      : undefined;
+    if (typeof content !== "string") {
+      throw new ApiError(400, "INVALID_PROMPT_PACK_PAYLOAD", "content must be a string");
+    }
+
+    const file = promptOverridePath(root, promptId);
+    await mkdir(dirname(file), { recursive: true });
+    await writeFile(file, content, "utf-8");
+    const prompt = listBuiltinPrompts().find((item) => item.id === promptId);
+    return c.json({ prompt: await toStudioPromptPackPrompt(root, prompt!) });
+  });
+
+  app.delete("/api/v1/prompt-packs/:promptId", async (c) => {
+    const promptId = normalizeStudioPromptId(c.req.param("promptId"));
+    const file = promptOverridePath(root, promptId);
+    await rm(file, { force: true });
+    const prompt = listBuiltinPrompts().find((item) => item.id === promptId);
+    return c.json({ prompt: await toStudioPromptPackPrompt(root, prompt!) });
+  });
+
   app.post("/api/v1/skills", async (c) => {
     const payload = await c.req.json().catch(() => {
       throw new ApiError(400, "INVALID_SKILL_PAYLOAD", "Skill payload must be JSON");
@@ -3674,6 +3862,13 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     return c.json({ ok: true });
   });
 
+  app.post("/api/v1/sessions/:sessionId/abort", async (c) => {
+    const sessionId = c.req.param("sessionId");
+    const aborted = abortAgentSession(root, sessionId);
+    broadcast("agent:aborted", { sessionId, aborted });
+    return c.json({ ok: true, aborted });
+  });
+
   app.post("/api/v1/agent", async (c) => {
     const {
       instruction,
@@ -3685,6 +3880,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       actionPayload: reqActionPayload,
       requestedSkills: reqRequestedSkills,
       disabledSkills: reqDisabledSkills,
+      attachments: reqAttachments,
       playMode: reqPlayMode,
       model: reqModel,
       service: reqService,
@@ -3698,6 +3894,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       actionPayload?: unknown;
       requestedSkills?: unknown;
       disabledSkills?: unknown;
+      attachments?: unknown;
       playMode?: string;
       model?: string;
       service?: string;
@@ -3719,9 +3916,10 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const actionPayload = normalizeStudioActionPayload(reqActionPayload);
     const requestedSkills = normalizeStudioSkillIdList(reqRequestedSkills, "requestedSkills");
     const disabledSkills = normalizeStudioSkillIdList(reqDisabledSkills, "disabledSkills");
+    const attachments = await normalizeAgentAttachments(root, sessionId, reqAttachments);
     const playMode = normalizeStudioPlayMode(reqPlayMode);
 
-    broadcast("agent:start", { instruction, activeBookId, sessionId, actionSource, requestedIntent, requestedSkills });
+    broadcast("agent:start", { instruction, activeBookId, sessionId, actionSource, requestedIntent, requestedSkills, attachments: attachments.length });
 
     try {
       // Load config + create LLM client (pipeline created after model resolution)
@@ -4168,6 +4366,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           actionPayload,
           requestedSkills,
           disabledSkills,
+          attachments,
           sessionId: bookSession.sessionId,
           language: surfaceLanguage,
           onContextCompression: (event) => {
