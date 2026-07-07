@@ -18,6 +18,7 @@ import { runInteractiveFilmCreation, runScriptCreation, runStoryboardCreation } 
 import { runResearchReport } from "../agents/researcher.js";
 import { ingestMaterial } from "../materials/ingest.js";
 import { retrieveMaterials } from "../materials/retrieve.js";
+import { loadChaptersFromPath } from "./chapter-import-source.js";
 import type { ScriptTargetFormat } from "../agents/script-storyboard.js";
 import { createPlayDB, type PlayGraphDB } from "../play/play-db-factory.js";
 import { PlayRunner, type PlayOpeningSeedResult, type PlayReplayResult, type PlayStepResult, type PlayVariantRestoreResult } from "../play/play-runner.js";
@@ -68,6 +69,11 @@ function createDeterministicInteractionTools(pipeline: PipelineRunner, projectRo
 
 function closePlayDB(db: PlayGraphDB): void {
   db.close?.();
+}
+
+// runnerFactory 注入的测试替身没有 close 方法，可选调用兜底。
+function closePlayRunner(runner: unknown): void {
+  (runner as { close?: () => void }).close?.();
 }
 
 function safePlayId(value: string | undefined, fallback: string): string {
@@ -591,8 +597,13 @@ export function createSubAgentTool(
   pipeline: PipelineRunner,
   activeBookId: string | null,
   projectRoot?: string,
-  options: { readonly actionPayload?: ActionPayload; readonly architectCreateOnly?: boolean } = {},
+  options: {
+    readonly actionPayload?: ActionPayload;
+    readonly architectCreateOnly?: boolean;
+    readonly language?: "zh" | "en";
+  } = {},
 ): AgentTool<any> {
+  const sessionIsZh = (options.language ?? "zh") !== "en";
   return {
     name: "sub_agent",
     description: options.architectCreateOnly
@@ -623,7 +634,11 @@ export function createSubAgentTool(
           return textResult("No active book. Only the architect agent can create a book from this session.");
         }
         if (activeBookId && agent === "architect" && !revise) {
-          return textResult("当前已有书籍，不需要建书。如果你想创建新书，请先回到首页。");
+          return textResult(
+            sessionIsZh
+              ? "当前已有书籍，不需要建书。如果你想创建新书，请先回到首页。"
+              : "This session already has a book, so no new book is needed. To create a new book, go back to the home page first.",
+          );
         }
 
         switch (agent) {
@@ -638,7 +653,9 @@ export function createSubAgentTool(
               await pipeline.reviseFoundation(targetBookId, feedback ?? instruction);
               progress(`Foundation revised for "${targetBookId}".`);
               return textResult(
-                `Book "${targetBookId}" 架构稿已按要求重写。原书的条目式架构稿已备份到 story/.backup-phase4-<时间戳>/。`,
+                sessionIsZh
+                  ? `Book "${targetBookId}" 架构稿已按要求重写。原书的条目式架构稿已备份到 story/.backup-phase4-<时间戳>/。`
+                  : `Book "${targetBookId}" foundation has been rewritten as requested. The previous itemized foundation was backed up to story/.backup-phase4-<timestamp>/.`,
               );
             }
             const confirmedTitle = createBookPayload?.title?.trim();
@@ -1063,6 +1080,100 @@ export function createRetrieveMaterialTool(projectRoot: string): AgentTool<typeo
   };
 }
 
+// ---------------------------------------------------------------------------
+// 5. Chapter Import Tool (import_chapters)
+// ---------------------------------------------------------------------------
+
+const ImportChaptersParams = Type.Object({
+  bookId: Type.Optional(Type.String({
+    description: "Target book ID to import into. In active-book sessions, omit it to use the current active book; if provided, it must match the active book. In general chat there is no active book, so it is required and must be an existing book.",
+  })),
+  sourcePath: Type.String({
+    description: "Local path of the chapter source: either the stored_path from the Uploaded Files block (project-relative, e.g. .inkos/uploads/<session>/novel.txt) or an absolute path on this machine that the user provided. A directory imports each .md/.txt file as one chapter in filename order; a single file is split into chapters automatically by heading lines.",
+  }),
+  splitPattern: Type.Optional(Type.String({
+    description: "Single-file mode only: custom JavaScript regex source matching chapter heading lines. Omit to use the default pattern, which matches \"第X章/第X回\" and \"Chapter N\" headings.",
+  })),
+  resumeFrom: Type.Optional(Type.Number({
+    description: "Resume an interrupted import from chapter N (1-based). Required when the book already has chapters: replay starts at chapter N and earlier chapters are kept. Omit for a fresh import into an empty book.",
+  })),
+  importMode: Type.Optional(Type.Union([
+    Type.Literal("continuation"),
+    Type.Literal("series"),
+  ], {
+    description: "continuation (default): the book picks up exactly where the imported text left off, no new spacetime. series: shared universe but an independent new story, so a new spacetime is generated.",
+  })),
+});
+
+type ImportChaptersParamsType = Static<typeof ImportChaptersParams>;
+
+export function createImportChaptersTool(
+  pipeline: PipelineRunner,
+  activeBookId: string | null,
+  projectRoot: string,
+): AgentTool<typeof ImportChaptersParams> {
+  return {
+    name: "import_chapters",
+    description:
+      "Import an existing novel's chapters from a local file or directory into an InkOS book as real chapters (not reference material). " +
+      "InkOS reverse-engineers foundation/truth files from the imported text and replays every chapter to rebuild story state, so the book can be continued afterwards. " +
+      "Use ingest_material instead when the user only wants to archive reference material without touching book chapters.",
+    label: "Import Chapters",
+    parameters: ImportChaptersParams,
+    async execute(
+      _toolCallId: string,
+      params: ImportChaptersParamsType,
+      _signal?: AbortSignal,
+      onUpdate?: AgentToolUpdateCallback,
+    ): Promise<AgentToolResult<unknown>> {
+      const targetBookId = resolveToolBookId("import_chapters", params.bookId, activeBookId);
+
+      const state = new StateManager(projectRoot);
+      const existingChapterCount = (await state.getNextChapterNumber(targetBookId)) - 1;
+      if (existingChapterCount > 0 && params.resumeFrom === undefined) {
+        throw new Error(
+          `Book "${targetBookId}" already has ${existingChapterCount} chapter(s). ` +
+          `Pass resumeFrom=<n> to resume/append from chapter n, or ask the user to clear the existing chapters first.`,
+        );
+      }
+
+      const resolvedSourcePath = isAbsolute(params.sourcePath)
+        ? params.sourcePath
+        : resolve(projectRoot, params.sourcePath);
+      onUpdate?.(textResult(`Reading chapters from ${resolvedSourcePath}...`));
+      const chapters = await loadChaptersFromPath(resolvedSourcePath, params.splitPattern);
+
+      onUpdate?.(textResult(`Found ${chapters.length} chapter(s); importing into "${targetBookId}"...`));
+      const result = await pipeline.importChapters({
+        bookId: targetBookId,
+        chapters,
+        resumeFrom: params.resumeFrom,
+        importMode: params.importMode,
+      });
+
+      const regeneratedFoundation = (params.resumeFrom ?? 1) === 1;
+      return textResult(
+        [
+          `Imported ${result.importedCount} chapter(s) into book "${result.bookId}".`,
+          `Total imported length: ${result.totalWords}. Next chapter to write: ${result.nextChapter}.`,
+          regeneratedFoundation
+            ? "Foundation and truth files were reverse-engineered from the imported text; chapter files and the chapter index were rebuilt by sequential replay."
+            : `Resumed replay from chapter ${params.resumeFrom}; earlier chapters and the existing foundation were kept.`,
+          `The book can now be continued with sub_agent(agent="writer") in the book session.`,
+        ].join("\n"),
+        {
+          kind: "chapters_imported",
+          bookId: result.bookId,
+          importedCount: result.importedCount,
+          totalWords: result.totalWords,
+          nextChapter: result.nextChapter,
+          importMode: params.importMode ?? "continuation",
+        },
+      );
+    },
+  };
+}
+
 function slugResearchTopic(topic: string): string {
   const slug = topic
     .normalize("NFKC")
@@ -1100,7 +1211,7 @@ const ShortFictionRunParams = Type.Object({
     description: "Target complete short chapter count, 12-18. Default 12.",
   })),
   charsPerChapter: Type.Optional(Type.Number({
-    description: "Target Chinese characters per chapter, 900-1200. Default 1000. Do not use total story length here.",
+    description: "Per-chapter length in the story language's native unit: 900-1200 Chinese characters (default 1000) for zh, or 600-800 English words (default 650) for en. Do not use total story length here.",
   })),
   cover: Type.Optional(Type.Boolean({
     description: "Whether to attempt cover image generation after synopsis and cover prompt. Default true; use false if the user only wants text assets.",
@@ -1127,7 +1238,7 @@ type ShortFictionRunParamsType = Static<typeof ShortFictionRunParams>;
 export function createShortFictionRunTool(
   pipeline: PipelineRunner,
   projectRoot: string,
-  options: { readonly actionPayload?: ActionPayload } = {},
+  options: { readonly actionPayload?: ActionPayload; readonly language?: "zh" | "en" } = {},
 ): AgentTool<typeof ShortFictionRunParams> {
   return {
     name: "short_fiction_run",
@@ -1160,6 +1271,7 @@ export function createShortFictionRunTool(
         storyId: shortPayload?.storyId ?? params.storyId,
         chapterCount: shortPayload?.chapters ?? params.chapters,
         charsPerChapter: shortPayload?.charsPerChapter ?? params.charsPerChapter,
+        language: options.language,
         cover: shortPayload?.cover ?? params.cover,
         coverBaseUrl: params.coverBaseUrl,
         coverEndpoint: params.coverEndpoint,
@@ -1252,7 +1364,7 @@ type ScriptCreateParamsType = Static<typeof ScriptCreateParams>;
 export function createScriptCreationTool(
   pipeline: PipelineRunner,
   projectRoot: string,
-  options: { readonly actionPayload?: ActionPayload } = {},
+  options: { readonly actionPayload?: ActionPayload; readonly language?: "zh" | "en" } = {},
 ): AgentTool<typeof ScriptCreateParams> {
   return {
     name: "script_create",
@@ -1281,6 +1393,7 @@ export function createScriptCreationTool(
         requirements: payload?.requirements ?? params.requirements,
         episodeCount: payload?.episodeCount ?? params.episodeCount,
         episodeDuration: payload?.episodeDuration ?? params.episodeDuration,
+        language: options.language,
         projectId: payload?.projectId ?? params.projectId,
         outDir: payload?.outDir ?? params.outDir,
         onProgress: progress,
@@ -1342,7 +1455,7 @@ type StoryboardCreateParamsType = Static<typeof StoryboardCreateParams>;
 export function createStoryboardCreationTool(
   pipeline: PipelineRunner,
   projectRoot: string,
-  options: { readonly actionPayload?: ActionPayload } = {},
+  options: { readonly actionPayload?: ActionPayload; readonly language?: "zh" | "en" } = {},
 ): AgentTool<typeof StoryboardCreateParams> {
   return {
     name: "storyboard_create",
@@ -1372,6 +1485,7 @@ export function createStoryboardCreationTool(
         aspectRatio: payload?.aspectRatio ?? params.aspectRatio,
         granularity: payload?.granularity ?? params.granularity,
         maxShots: payload?.maxShots ?? params.maxShots,
+        language: options.language,
         projectId: payload?.projectId ?? params.projectId,
         outDir: payload?.outDir ?? params.outDir,
         onProgress: progress,
@@ -1438,7 +1552,7 @@ type InteractiveFilmCreateParamsType = Static<typeof InteractiveFilmCreateParams
 export function createInteractiveFilmCreationTool(
   pipeline: PipelineRunner,
   projectRoot: string,
-  options: { readonly actionPayload?: ActionPayload } = {},
+  options: { readonly actionPayload?: ActionPayload; readonly language?: "zh" | "en" } = {},
 ): AgentTool<typeof InteractiveFilmCreateParams> {
   return {
     name: "interactive_film_create",
@@ -1469,6 +1583,7 @@ export function createInteractiveFilmCreationTool(
         episodeDuration: payload?.episodeDuration ?? params.episodeDuration,
         budget: payload?.budget ?? params.budget,
         referenceMode: payload?.referenceMode ?? params.referenceMode,
+        language: options.language,
         projectId: payload?.projectId ?? params.projectId,
         outDir: payload?.outDir ?? params.outDir,
         onProgress: progress,
@@ -1742,6 +1857,7 @@ const PlayStepParams = Type.Object({
 type PlayStepParamsType = Static<typeof PlayStepParams>;
 
 export interface PlayStepToolOptions {
+  readonly language?: "zh" | "en";
   readonly runnerFactory?: (input: {
     readonly projectRoot: string;
     readonly worldId: string;
@@ -1772,6 +1888,7 @@ const PlayReviseParams = Type.Object({
 type PlayReviseParamsType = Static<typeof PlayReviseParams>;
 
 export interface PlayReviseToolOptions {
+  readonly language?: "zh" | "en";
   readonly runnerFactory?: (input: {
     readonly projectRoot: string;
     readonly worldId: string;
@@ -1862,6 +1979,7 @@ type PlayEditParamsType = Static<typeof PlayEditParams>;
 export function createPlayEditTool(
   projectRoot: string,
   sessionId: string,
+  language: "zh" | "en" = "zh",
 ): AgentTool<typeof PlayEditParams> {
   return {
     name: "play_edit",
@@ -1879,8 +1997,13 @@ export function createPlayEditTool(
       const runId = "main";
       const world = await store.loadWorld(worldId);
       if (!world) {
-        return textResult("还没有可编辑的互动世界。先用 play_start 开一局。");
+        return textResult(
+          language === "en"
+            ? "There is no interactive world to edit yet. Start one with play_start first."
+            : "还没有可编辑的互动世界。先用 play_start 开一局。",
+        );
       }
+      const isZh = (world.language ?? "zh") !== "en";
 
       const patch: Parameters<PlayStore["updateWorld"]>[1] = {};
       const nextWorldContract = mergeContract(
@@ -1913,9 +2036,9 @@ export function createPlayEditTool(
           upsertPlayEditEntity(db, {
             id: "actor_player",
             type: "actor",
-            label: existingPlayer?.label ?? "玩家",
+            label: existingPlayer?.label ?? (isZh ? "玩家" : "Player"),
             summary: playerPersona,
-            status: "已更新",
+            status: isZh ? "已更新" : "Updated",
           });
           updatedEntities += 1;
         }
@@ -1932,7 +2055,7 @@ export function createPlayEditTool(
           graphEditedAt: new Date().toISOString(),
         });
         return textResult(
-          params.note?.trim() || "互动世界设定已更新。",
+          params.note?.trim() || (isZh ? "互动世界设定已更新。" : "Interactive world settings updated."),
           {
             kind: "play_world_updated",
             worldId,
@@ -1979,7 +2102,11 @@ export function createPlayStepTool(
       const runId = "main";
       const world = await store.loadWorld(worldId);
       if (!world) {
-        return textResult("还没有可推进的互动世界。先用 play_start 开一局。");
+        return textResult(
+          options.language === "en"
+            ? "There is no interactive world to advance yet. Start one with play_start first."
+            : "还没有可推进的互动世界。先用 play_start 开一局。",
+        );
       }
       const target = { worldId, runId, world };
       onUpdate?.(textResult(`Advancing "${target.worldId}" / "${target.runId}"...`));
@@ -2014,6 +2141,8 @@ export function createPlayStepTool(
             error: err instanceof Error ? err.message : String(err),
           },
         );
+      } finally {
+        closePlayRunner(runner);
       }
 
       const db = createPlayDB(store.runDir(target.worldId, target.runId));
@@ -2068,8 +2197,13 @@ export function createPlayReviseTool(
       const runId = "main";
       const world = await store.loadWorld(worldId);
       if (!world) {
-        return textResult("还没有可重做的互动世界。先用 play_start 开一局。");
+        return textResult(
+          options.language === "en"
+            ? "There is no interactive world to redo yet. Start one with play_start first."
+            : "还没有可重做的互动世界。先用 play_start 开一局。",
+        );
       }
+      const isZh = (world.language ?? "zh") !== "en";
       const ctx = pipeline.createAgentContext("play");
       const runner = options.runnerFactory?.({ projectRoot, worldId, runId, ctx }) ?? new PlayRunner({
         projectRoot,
@@ -2078,52 +2212,64 @@ export function createPlayReviseTool(
         ctx,
       });
 
-      if (params.action === "restore_variant") {
-        const turn = params.turn;
-        const variantId = params.variantId?.trim();
-        if (typeof turn !== "number" || !Number.isFinite(turn) || !variantId) {
-          return textResult("恢复版本需要 turn 和 variantId。");
-        }
-        onUpdate?.(textResult(`Restoring play variant "${variantId}"...`));
-        const restored = await runner.restoreVariant({
-          turn: Math.trunc(turn),
-          variantId,
-        });
-        return textResult(
-          restored.sceneText || "已切换到指定互动回合版本。",
-          {
-            kind: "play_variant_restored",
-            worldId,
-            runId,
-            title: world.title,
-            turn: restored.turn,
-            variantId: restored.variantId,
-            sceneText: restored.sceneText,
-          },
-        );
-      }
-
-      const replacement = params.action === "edit_last_input" ? params.input?.trim() : undefined;
-      if (params.action === "edit_last_input" && !replacement) {
-        return textResult("编辑上一条玩家动作需要提供新的 input。");
-      }
-      onUpdate?.(textResult(params.action === "edit_last_input" ? "Replaying edited play turn..." : "Regenerating last play turn..."));
       let replay: PlayReplayResult;
+      // finally 关闭 runner 自建的 play.db 连接：句柄不关闭时 Windows 上无法删除数据库文件。
       try {
-        replay = await runner.regenerateLastTurn(replacement);
-      } catch (err) {
-        const isZh = (world.language ?? "zh") !== "en";
-        return textResult(
-          isZh
-            ? "（上一回合暂时不能安全重做。继续输入新的动作，我会从当前状态推进。）"
-            : "(The previous turn cannot be safely regenerated yet. Enter a new action and I will continue from the current state.)",
-          {
-            kind: "play_revise_failed",
-            worldId,
-            runId,
-            error: err instanceof Error ? err.message : String(err),
-          },
-        );
+        if (params.action === "restore_variant") {
+          const turn = params.turn;
+          const variantId = params.variantId?.trim();
+          if (typeof turn !== "number" || !Number.isFinite(turn) || !variantId) {
+            return textResult(
+              isZh
+                ? "恢复版本需要 turn 和 variantId。"
+                : "Restoring a variant requires both turn and variantId.",
+            );
+          }
+          onUpdate?.(textResult(`Restoring play variant "${variantId}"...`));
+          const restored = await runner.restoreVariant({
+            turn: Math.trunc(turn),
+            variantId,
+          });
+          return textResult(
+            restored.sceneText || (isZh ? "已切换到指定互动回合版本。" : "Switched to the requested play turn variant."),
+            {
+              kind: "play_variant_restored",
+              worldId,
+              runId,
+              title: world.title,
+              turn: restored.turn,
+              variantId: restored.variantId,
+              sceneText: restored.sceneText,
+            },
+          );
+        }
+
+        const replacement = params.action === "edit_last_input" ? params.input?.trim() : undefined;
+        if (params.action === "edit_last_input" && !replacement) {
+          return textResult(
+            isZh
+              ? "编辑上一条玩家动作需要提供新的 input。"
+              : "Editing the previous player action requires a new input.",
+          );
+        }
+        onUpdate?.(textResult(params.action === "edit_last_input" ? "Replaying edited play turn..." : "Regenerating last play turn..."));
+        try {
+          replay = await runner.regenerateLastTurn(replacement);
+        } catch (err) {
+          return textResult(
+            isZh
+              ? "（上一回合暂时不能安全重做。继续输入新的动作，我会从当前状态推进。）"
+              : "(The previous turn cannot be safely regenerated yet. Enter a new action and I will continue from the current state.)",
+            {
+              kind: "play_revise_failed",
+              worldId,
+              runId,
+              error: err instanceof Error ? err.message : String(err),
+            },
+          );
+        }
+      } finally {
+        closePlayRunner(runner);
       }
 
       const db = createPlayDB(store.runDir(worldId, runId));

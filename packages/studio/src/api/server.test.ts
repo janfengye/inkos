@@ -1556,6 +1556,68 @@ describe("createStudioServer daemon lifecycle", () => {
     expect(chatCompletionMock).not.toHaveBeenCalled();
   });
 
+  it("returns English probe errors when the project language is en", async () => {
+    await writeFile(join(root, "inkos.json"), JSON.stringify({
+      ...projectConfig,
+      language: "en",
+      llm: {
+        configSource: "env",
+        services: [
+          { service: "custom", name: "MiniMax", baseUrl: "https://api.minimax.com/v1" },
+        ],
+      },
+    }, null, 2), "utf-8");
+
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 404,
+      text: async () => "404 page not found",
+    });
+    vi.stubGlobal("fetch", fetchMock as typeof fetch);
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/services/custom%3AMiniMax/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        apiKey: "sk-minimax",
+        baseUrl: "https://api.minimax.com/v1",
+        apiFormat: "chat",
+        stream: true,
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      ok: false,
+      error: expect.stringContaining("Could not determine a model automatically"),
+    });
+  });
+
+  it("returns an English empty-API-key error when the project language is en", async () => {
+    await writeFile(join(root, "inkos.json"), JSON.stringify({
+      ...projectConfig,
+      language: "en",
+    }, null, 2), "utf-8");
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/services/openai/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ apiKey: "" }),
+    });
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      ok: false,
+      error: "API Key must not be empty",
+    });
+  });
+
   it("falls back to the detected/default model when custom /models is unavailable", async () => {
     await writeFile(join(root, "inkos.json"), JSON.stringify({
       ...projectConfig,
@@ -4251,6 +4313,42 @@ describe("createStudioServer daemon lifecycle", () => {
 
     expect(response.status).toBe(200);
     expect(pipelineConfigs.at(-1)).toMatchObject({ chapterReviewMode: "manual" });
+  });
+
+  it("uses a book-level revisionGate override when revising a chapter", async () => {
+    await writeCompleteBookFixture(root, "demo-book", "Demo Book");
+    const rawBookPath = join(root, "books", "demo-book", "book.json");
+    const rawBook = JSON.parse(await readFile(rawBookPath, "utf-8"));
+    await writeFile(rawBookPath, JSON.stringify({
+      ...rawBook,
+      writing: { revisionGate: "always" },
+    }, null, 2), "utf-8");
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/books/demo-book/revise/3", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "spot-fix" }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(pipelineConfigs.at(-1)).toMatchObject({ revisionGate: "always" });
+  });
+
+  it("defaults the revisionGate to strict when neither book nor project sets one", async () => {
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/books/demo-book/revise/3", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "spot-fix" }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(pipelineConfigs.at(-1)).toMatchObject({ revisionGate: "strict" });
   });
 
   it("exposes a global default model endpoint backed by llm.defaultModel", async () => {
