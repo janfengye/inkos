@@ -47,6 +47,7 @@ import {
   Clapperboard,
   Rows3,
   Film,
+  Languages,
 } from "lucide-react";
 import { InkosLogo } from "./InkosLogo";
 
@@ -82,6 +83,7 @@ interface Nav {
   toLogs: () => void;
   toGenres: () => void;
   toStyle: () => void;
+  toTranslation: () => void;
   toImport: (tab?: "chapters" | "canon" | "fanfic" | "spinoff" | "imitation") => void;
   toRadar: () => void;
   toDoctor: () => void;
@@ -316,6 +318,7 @@ export function Sidebar({ nav, activePage, sse, t }: {
             <CreateItem icon={<BookCopy size={16} />} label={t("nav.createSpinoff")} onClick={() => nav.toImport("spinoff")} />
             <CreateItem icon={<Wand2 size={16} />} label={t("nav.createImitation")} onClick={() => nav.toImport("imitation")} />
             <CreateItem icon={<FileInput size={16} />} label={t("nav.createContinuation")} onClick={() => nav.toImport("chapters")} />
+            <CreateItem icon={<Languages size={16} />} label={t("nav.createTranslation")} active={activePage === "translation"} onClick={nav.toTranslation} />
             <CreateItem icon={<GitBranch size={16} />} label={t("nav.createBranching")} onClick={() => launchProjectMode("play", "guided")} />
             <CreateItem icon={<Gamepad2 size={16} />} label={t("nav.createFree")} onClick={() => launchProjectMode("play", "open")} />
           </div>
