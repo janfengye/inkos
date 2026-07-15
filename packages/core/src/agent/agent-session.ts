@@ -43,6 +43,11 @@ import {
   createImportChaptersTool,
 } from "./agent-tools.js";
 import { createFilmAuthoringTools, filmLLMDepsFromClient } from "./film-authoring-tools.js";
+import {
+  createNarrativeForecastCreateTool,
+  createNarrativeForecastGetTool,
+  createNarrativeForecastSelectTool,
+} from "./forecast-tools.js";
 import { createBookContextTransform } from "./context-transform.js";
 import {
   appendTranscriptEvents,
@@ -104,6 +109,22 @@ export interface AgentSessionConfig {
   onContextCompression?: ContextCompressionCallback;
   /** Attachments uploaded with this user turn. Text is injected as protected user context; images use pi-ai ImageContent. */
   attachments?: ReadonlyArray<AgentSessionAttachment>;
+  /**
+   * Status block for a production task running in the background of this session
+   * (e.g. a confirmed short-fiction run). Appended to the system prompt so the
+   * agent can answer progress questions instead of claiming nothing is running.
+   * Changing this value evicts the cached Agent so the prompt stays current.
+   */
+  backgroundTaskContext?: string;
+  /**
+   * Remove book/artifact-mutating production tools from this turn's tool table
+   * (a confirmed production task is already running in this session, so a
+   * parallel chat turn must not mutate the same book concurrently). Read-style
+   * tools, research/material tools, and propose_action stay available —
+   * confirmed actions started via propose_action are gated host-side anyway.
+   * Changing this value evicts the cached Agent so the tool table stays current.
+   */
+  suppressProductionTools?: boolean;
 }
 
 export interface AgentSessionResult {
@@ -147,6 +168,8 @@ interface CachedAgent {
   modelIdentity: string;
   apiKey: string | undefined;
   allowSystemFileRead: boolean;
+  backgroundTaskContext: string | undefined;
+  suppressProductionTools: boolean;
   lastCommittedSeq: number;
   lastActive: number;
 }
@@ -737,6 +760,21 @@ function agentMessagesToPlain(
 // Main entry point
 // ---------------------------------------------------------------------------
 
+/**
+ * 会创建/修改书籍与产物的生产工具。suppressProductionTools 为 true（同会话
+ * 有后台生产任务在运行）时从工具表剔除；read/grep/ls、research/material 与
+ * propose_action 保留——propose_action 引发的确认任务在 host 侧另有单任务闸门。
+ */
+const PRODUCTION_MUTATION_TOOL_NAMES = new Set([
+  "sub_agent",
+  "generate_cover",
+  "write_truth_file",
+  "rename_entity",
+  "patch_chapter_text",
+  "replace_chapter_text",
+  "import_chapters",
+]);
+
 function createAgentToolsForMode(params: {
   readonly pipeline: PipelineRunner;
   readonly bookId: string | null;
@@ -869,12 +907,25 @@ function createAgentToolsForMode(params: {
     materialTool,
     materialRetrievalTool,
     importChaptersTool,
+    createNarrativeForecastCreateTool(params.pipeline, params.bookId, params.projectRoot),
+    createNarrativeForecastGetTool(params.bookId, params.projectRoot),
+    createNarrativeForecastSelectTool(params.bookId, params.projectRoot),
     createGrepTool(params.projectRoot),
     createLsTool(params.projectRoot),
   ];
 
   if (params.sessionKind === "edit") {
-    return bookTools.filter((tool) => !["sub_agent", "generate_cover", "research_web", "import_chapters"].includes(tool.name));
+    // Edit mode stays deterministic: forecast create runs an LLM projection,
+    // and get/select belong to the planning workflow, not text editing.
+    return bookTools.filter((tool) => ![
+      "sub_agent",
+      "generate_cover",
+      "research_web",
+      "import_chapters",
+      "create_narrative_forecast",
+      "get_narrative_forecast",
+      "select_narrative_branch",
+    ].includes(tool.name));
   }
 
   return bookTools;
@@ -926,6 +977,7 @@ async function runAgentSessionUnlocked(
   const model = resolveModel(config.model);
   const requestedModelIdentity = agentModelIdentity(model);
   const allowSystemFileRead = config.allowSystemFileRead ?? envFlagEnabled(process.env.INKOS_AGENT_ALLOW_SYSTEM_READ, false);
+  const suppressProductionTools = config.suppressProductionTools ?? false;
   const playWorldExists = sessionKind === "play"
     ? Boolean(await new PlayStore(projectRoot).loadWorld(sessionId))
     : false;
@@ -953,6 +1005,8 @@ async function runAgentSessionUnlocked(
     const apiKeyChanged = cached.apiKey !== config.apiKey;
     const readPermissionChanged = cached.allowSystemFileRead !== allowSystemFileRead;
     const playWorldChanged = cached.playWorldExists !== playWorldExists;
+    const backgroundTaskContextChanged = cached.backgroundTaskContext !== config.backgroundTaskContext;
+    const suppressProductionToolsChanged = cached.suppressProductionTools !== suppressProductionTools;
     const transcriptChanged = cached.lastCommittedSeq !== currentCommittedSeq;
 
     if (
@@ -968,6 +1022,8 @@ async function runAgentSessionUnlocked(
       apiKeyChanged ||
       readPermissionChanged ||
       playWorldChanged ||
+      backgroundTaskContextChanged ||
+      suppressProductionToolsChanged ||
       transcriptChanged
     ) {
       agentCache.delete(cacheKey);
@@ -1002,29 +1058,35 @@ async function runAgentSessionUnlocked(
         ? plainToAgentMessages(initialMessages)
         : [];
     let terminalToolResultTail = false;
+    const baseSystemPrompt = buildAgentSystemPrompt(bookId, language, sessionKind, {
+      actionSource,
+      requestedIntent,
+      playWorldExists,
+      skills: skillResolution,
+    });
+    const agentTools = createAgentToolsForMode({
+      pipeline,
+      bookId,
+      sessionId,
+      sessionKind,
+      actionSource,
+      requestedIntent,
+      actionPayload,
+      projectRoot,
+      allowSystemFileRead,
+      language,
+      playMode,
+      playWorldExists,
+    });
     const agent = new Agent({
       initialState: {
         model,
-        systemPrompt: buildAgentSystemPrompt(bookId, language, sessionKind, {
-          actionSource,
-          requestedIntent,
-          playWorldExists,
-          skills: skillResolution,
-        }),
-        tools: createAgentToolsForMode({
-          pipeline,
-          bookId,
-          sessionId,
-          sessionKind,
-          actionSource,
-          requestedIntent,
-          actionPayload,
-          projectRoot,
-          allowSystemFileRead,
-          language,
-          playMode,
-          playWorldExists,
-        }),
+        systemPrompt: config.backgroundTaskContext
+          ? `${baseSystemPrompt}\n\n${config.backgroundTaskContext}`
+          : baseSystemPrompt,
+        tools: suppressProductionTools
+          ? agentTools.filter((tool) => !PRODUCTION_MUTATION_TOOL_NAMES.has(tool.name))
+          : agentTools,
         messages: initialAgentMessages,
       },
       transformContext: createBookContextTransform(bookId, projectRoot, { onContextCompression }),
@@ -1061,6 +1123,8 @@ async function runAgentSessionUnlocked(
       modelIdentity: requestedModelIdentity,
       apiKey: config.apiKey,
       allowSystemFileRead,
+      backgroundTaskContext: config.backgroundTaskContext,
+      suppressProductionTools,
       lastCommittedSeq: currentCommittedSeq ?? await latestCommittedSeq(projectRoot, sessionId),
       lastActive: Date.now(),
     };

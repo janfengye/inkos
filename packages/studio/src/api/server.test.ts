@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { loadStudioTaskSnapshot, saveStudioTaskSnapshot, studioTaskSnapshotPath } from "./task-store.js";
 
 const schedulerStartMock = vi.fn<() => Promise<void>>();
 const initBookMock = vi.fn();
@@ -25,6 +26,7 @@ const createLLMClientMock = vi.fn(() => ({}));
 const chatCompletionMock = vi.fn();
 const loadProjectConfigMock = vi.fn();
 const pipelineConfigs: unknown[] = [];
+const pipelineAbortSignals: Array<AbortSignal | undefined> = [];
 const processProjectInteractionRequestMock = vi.fn();
 const createInteractionToolsFromDepsMock = vi.fn(() => ({}));
 const loadProjectSessionMock = vi.fn();
@@ -47,6 +49,17 @@ const loadSecretsMock = vi.fn();
 const saveSecretsMock = vi.fn();
 const getServiceApiKeyMock = vi.fn();
 const createLLMTranslationModelMock = vi.fn();
+const createShortFictionRunToolMock = vi.fn((_pipeline: unknown, _root: string, _options?: unknown) => ({
+  name: "short_fiction_run",
+  execute: vi.fn(async () => ({
+    content: [{ type: "text", text: "Short fiction completed." }],
+    details: {
+      kind: "short_fiction_created",
+      storyId: "english-short",
+      finalMarkdownPath: "shorts/english-short/final/full.md",
+    },
+  })),
+}));
 type ServicePresetMock = {
   providerFamily: "openai" | "anthropic";
   baseUrl: string;
@@ -185,6 +198,14 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
       pipelineConfigs.push(config);
     }
 
+    // 与真实 PipelineRunner.runWithAbortSignal 行为一致（入口检查一次 signal），
+    // 并把 signal 记录下来供测试断言"任务控制器的中止信号传进了写作流程"。
+    runWithAbortSignal = vi.fn(async (signal: AbortSignal | undefined, task: () => Promise<unknown>) => {
+      pipelineAbortSignals.push(signal);
+      signal?.throwIfAborted();
+      return task();
+    });
+
     initBook = initBookMock;
     runRadar = runRadarMock;
     planChapter = planChapterMock;
@@ -253,7 +274,7 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
     runAgentSession: runAgentSessionMock,
     abortAgentSession: abortAgentSessionMock,
     createSubAgentTool: actual.createSubAgentTool,
-    createShortFictionRunTool: actual.createShortFictionRunTool,
+    createShortFictionRunTool: createShortFictionRunToolMock,
     createGenerateCoverTool: actual.createGenerateCoverTool,
     createPlayStartTool: actual.createPlayStartTool,
     PlayRunner: MockPlayRunner,
@@ -470,6 +491,7 @@ describe("createStudioServer daemon lifecycle", () => {
         issues: [],
       })),
     });
+    createShortFictionRunToolMock.mockClear();
     chatCompletionMock.mockReset();
     chatCompletionMock.mockResolvedValue({
       content: "pong",
@@ -536,6 +558,7 @@ describe("createStudioServer daemon lifecycle", () => {
     saveChapterIndexMock.mockResolvedValue(undefined);
     rollbackToChapterMock.mockResolvedValue([]);
     pipelineConfigs.length = 0;
+    pipelineAbortSignals.length = 0;
     runAgentSessionMock.mockReset();
     abortAgentSessionMock.mockReset();
     playRunnerStepMock.mockReset();
@@ -2863,6 +2886,1104 @@ describe("createStudioServer daemon lifecycle", () => {
     });
   });
 
+  it("infers English before directly executing a confirmed short action", async () => {
+    const shortSession = {
+      sessionId: "short-en-session",
+      bookId: null,
+      sessionKind: "short",
+      title: null,
+      messages: [],
+      events: [],
+      draftRounds: [],
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    loadBookSessionMock.mockResolvedValue(shortSession);
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "Write a complete English office suspense short story about forged expense records.",
+        sessionId: "short-en-session",
+        sessionKind: "short",
+        actionSource: "button",
+        requestedIntent: "short_run",
+        actionPayload: {
+          shortRun: {
+            direction: "an office suspense story about forged expense records",
+            chapters: 12,
+            cover: false,
+          },
+        },
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(runAgentSessionMock).not.toHaveBeenCalled();
+    expect(createShortFictionRunToolMock).toHaveBeenCalledWith(
+      expect.anything(),
+      root,
+      expect.objectContaining({ language: "en" }),
+    );
+  });
+
+  it("persists confirmed production progress before the long-running request completes", async () => {
+    let resolveInitBook!: () => void;
+    initBookMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveInitBook = resolve;
+    }));
+    loadBookSessionMock.mockResolvedValue({
+      sessionId: "long-task-session",
+      bookId: null,
+      sessionKind: "book-create",
+      title: null,
+      messages: [],
+      events: [],
+      draftRounds: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const pendingResponse = app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "创建《雨夜旧账》。",
+        sessionId: "long-task-session",
+        sessionKind: "book-create",
+        actionSource: "button",
+        requestedIntent: "create_book",
+        actionPayload: { createBook: { title: "雨夜旧账", language: "zh" } },
+      }),
+    });
+
+    await vi.waitFor(async () => {
+      const task = await loadStudioTaskSnapshot(root, "long-task-session");
+      expect(task?.execution).toMatchObject({
+        tool: "sub_agent",
+        agent: "architect",
+        status: "running",
+      });
+    });
+
+    resolveInitBook();
+    const response = await pendingResponse;
+    expect(response.status).toBe(200);
+    await expect(loadStudioTaskSnapshot(root, "long-task-session")).resolves.toMatchObject({
+      execution: {
+        tool: "sub_agent",
+        agent: "architect",
+        status: "completed",
+        completedAt: expect.any(Number),
+      },
+    });
+  });
+
+  it("persists a terminal error when a confirmed production task fails", async () => {
+    initBookMock.mockRejectedValueOnce(new Error("architect upstream failed"));
+    loadBookSessionMock.mockResolvedValue({
+      sessionId: "failed-task-session",
+      bookId: null,
+      sessionKind: "book-create",
+      title: null,
+      messages: [],
+      events: [],
+      draftRounds: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "创建《失败样本》。",
+        sessionId: "failed-task-session",
+        sessionKind: "book-create",
+        actionSource: "button",
+        requestedIntent: "create_book",
+        actionPayload: { createBook: { title: "失败样本", language: "zh" } },
+      }),
+    });
+
+    expect(response.status).toBeGreaterThanOrEqual(400);
+    await expect(loadStudioTaskSnapshot(root, "failed-task-session")).resolves.toMatchObject({
+      execution: {
+        tool: "sub_agent",
+        agent: "architect",
+        status: "error",
+        error: "architect upstream failed",
+        completedAt: expect.any(Number),
+      },
+    });
+  });
+
+  it("returns the persisted task snapshot with session detail while the task is still running", async () => {
+    let resolveInitBook!: () => void;
+    initBookMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveInitBook = resolve;
+    }));
+    loadBookSessionMock.mockResolvedValue({
+      sessionId: "refresh-task-session",
+      bookId: null,
+      sessionKind: "book-create",
+      title: null,
+      messages: [],
+      events: [],
+      draftRounds: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const pendingResponse = app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "创建《雨夜账本》。",
+        sessionId: "refresh-task-session",
+        sessionKind: "book-create",
+        actionSource: "button",
+        requestedIntent: "create_book",
+        actionPayload: { createBook: { title: "雨夜账本", language: "zh" } },
+      }),
+    });
+    await vi.waitFor(async () => {
+      const task = await loadStudioTaskSnapshot(root, "refresh-task-session");
+      expect(task?.execution.status).toBe("running");
+    });
+
+    const response = await app.request("http://localhost/api/v1/sessions/refresh-task-session");
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      session: { sessionId: "refresh-task-session" },
+      task: {
+        sessionId: "refresh-task-session",
+        execution: {
+          tool: "sub_agent",
+          agent: "architect",
+          status: "running",
+        },
+      },
+    });
+
+    resolveInitBook();
+    await pendingResponse;
+  });
+
+  it("rewrites a stale running task snapshot to error when the server has no live task for it", async () => {
+    // 直接写入 running 快照后新建 server 实例，等价于任务运行期间 server 进程重启：
+    // 快照必须被改写为终态，否则前端每次刷新都会恢复出一个永远运行中的任务卡。
+    await saveStudioTaskSnapshot(root, {
+      version: 1,
+      sessionId: "stale-task-session",
+      requestedIntent: "short_run",
+      updatedAt: 20,
+      execution: {
+        id: "stale-task-1",
+        tool: "short_fiction_run",
+        label: "生成短篇",
+        status: "running",
+        startedAt: 10,
+        logs: ["正在生成大纲"],
+      },
+    });
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/sessions/stale-task-session");
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      task: {
+        sessionId: "stale-task-session",
+        execution: {
+          id: "stale-task-1",
+          status: "error",
+          error: expect.any(String),
+          completedAt: expect.any(Number),
+        },
+      },
+    });
+    await expect(loadStudioTaskSnapshot(root, "stale-task-session")).resolves.toMatchObject({
+      execution: { id: "stale-task-1", status: "error" },
+    });
+  });
+
+  // 下面三个用例把 appendManualSessionMessages / loadBookSession 接回真实实现，
+  // 走真实 transcript 文件验证：确认式生产任务的用户指令必须在任务开始时就
+  // 写进 transcript（而不是任务完成后才补写），完成/失败时只追加助手工具消息。
+  async function wireRealSessionTranscript() {
+    const actual = await vi.importActual<typeof import("@actalk/inkos-core")>("@actalk/inkos-core");
+    appendManualSessionMessagesMock.mockImplementation(actual.appendManualSessionMessages);
+    loadBookSessionMock.mockImplementation(
+      (projectRoot: string, sessionId: string) => actual.loadBookSession(projectRoot, sessionId),
+    );
+    return actual;
+  }
+
+  function hangingShortFictionTool(): { resolveShort: () => void } {
+    const handle = { resolveShort: () => undefined as void };
+    createShortFictionRunToolMock.mockImplementationOnce(() => ({
+      name: "short_fiction_run",
+      execute: vi.fn(() => new Promise((resolve) => {
+        handle.resolveShort = () => resolve({
+          content: [{ type: "text", text: "短篇《雨夜档案》已完成。" }],
+          details: {
+            kind: "short_fiction_created",
+            storyId: "rainy-archive",
+            finalMarkdownPath: "shorts/rainy-archive/final/full.md",
+          },
+        });
+      })),
+    }));
+    return handle;
+  }
+
+  it("persists the production instruction to the transcript at task start", async () => {
+    const actual = await wireRealSessionTranscript();
+    await actual.createAndPersistBookSession(root, null, "instr-short-session", "short");
+    const handle = hangingShortFictionTool();
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const instruction = "写一篇雨夜档案馆悬疑短篇。";
+    const pendingTask = app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction,
+        sessionId: "instr-short-session",
+        sessionKind: "short",
+        actionSource: "button",
+        requestedIntent: "short_run",
+        actionPayload: { shortRun: { direction: "雨夜档案馆悬疑", chapters: 12, cover: false } },
+      }),
+    });
+    await vi.waitFor(async () => {
+      const task = await loadStudioTaskSnapshot(root, "instr-short-session");
+      expect(task?.execution.status).toBe("running");
+    });
+
+    // 任务运行中刷新：transcript 里已有这轮用户指令，用户气泡不会消失。
+    const midRun = await app.request("http://localhost/api/v1/sessions/instr-short-session");
+    expect(midRun.status).toBe(200);
+    const midBody = await midRun.json() as {
+      session: { messages: Array<{ role: string; content: string }> };
+      task?: { execution: { status: string } };
+    };
+    expect(midBody.task?.execution.status).toBe("running");
+    expect(midBody.session.messages).toEqual([
+      expect.objectContaining({ role: "user", content: instruction }),
+    ]);
+
+    handle.resolveShort();
+    const response = await pendingTask;
+    expect(response.status).toBe(200);
+
+    // 任务完成后：指令只出现一次，助手工具消息排在其后。
+    const final = await app.request("http://localhost/api/v1/sessions/instr-short-session");
+    const finalBody = await final.json() as {
+      session: { messages: Array<{ role: string; content: string; toolExecutions?: Array<{ tool: string; status: string }> }> };
+    };
+    expect(finalBody.session.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+    expect(
+      finalBody.session.messages.filter((message) => message.role === "user" && message.content === instruction),
+    ).toHaveLength(1);
+    expect(finalBody.session.messages[1]?.toolExecutions?.[0]).toMatchObject({
+      tool: "short_fiction_run",
+      status: "completed",
+    });
+  });
+
+  it("keeps real-time transcript order when a chat round lands during the production task", async () => {
+    const actual = await wireRealSessionTranscript();
+    await actual.createAndPersistBookSession(root, null, "order-short-session", "short");
+    const handle = hangingShortFictionTool();
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const instruction = "写一篇雨夜档案馆悬疑短篇。";
+    const pendingTask = app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction,
+        sessionId: "order-short-session",
+        sessionKind: "short",
+        actionSource: "button",
+        requestedIntent: "short_run",
+        actionPayload: { shortRun: { direction: "雨夜档案馆悬疑", chapters: 12, cover: false } },
+      }),
+    });
+    await vi.waitFor(async () => {
+      const task = await loadStudioTaskSnapshot(root, "order-short-session");
+      expect(task?.execution.status).toBe("running");
+    });
+
+    // 任务运行期间插入一轮并行聊天（真实 agent 路径会把聊天消息写进同一份 transcript）。
+    await actual.appendManualSessionMessages(root, "order-short-session", [
+      { role: "user", content: "任务进度如何？", timestamp: Date.now() },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "短篇任务还在运行。" }],
+        api: "anthropic-messages",
+        provider: "openai",
+        model: "gpt-5.4",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop",
+        timestamp: Date.now(),
+      },
+    ] as never, "任务进度如何？", { sessionKind: "short" });
+
+    handle.resolveShort();
+    const response = await pendingTask;
+    expect(response.status).toBe(200);
+
+    const final = await app.request("http://localhost/api/v1/sessions/order-short-session");
+    const finalBody = await final.json() as {
+      session: { messages: Array<{ role: string; content: string }> };
+    };
+    // 重新加载后按真实时间排序：生产指令在并行聊天之前，任务结果在最后。
+    expect(finalBody.session.messages.map((message) => [message.role, message.content])).toEqual([
+      ["user", instruction],
+      ["user", "任务进度如何？"],
+      ["assistant", "短篇任务还在运行。"],
+      ["assistant", expect.stringContaining("短篇《雨夜档案》已完成。")],
+    ]);
+  });
+
+  it("does not duplicate the instruction when the production task fails", async () => {
+    const actual = await wireRealSessionTranscript();
+    await actual.createAndPersistBookSession(root, null, "fail-short-session", "short");
+    createShortFictionRunToolMock.mockImplementationOnce(() => ({
+      name: "short_fiction_run",
+      execute: vi.fn(async () => {
+        throw new Error("short upstream failed");
+      }),
+    }));
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const instruction = "写一篇会失败的短篇。";
+    const response = await app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction,
+        sessionId: "fail-short-session",
+        sessionKind: "short",
+        actionSource: "button",
+        requestedIntent: "short_run",
+        actionPayload: { shortRun: { direction: "会失败的短篇", chapters: 12, cover: false } },
+      }),
+    });
+
+    expect(response.status).toBeGreaterThanOrEqual(400);
+    const final = await app.request("http://localhost/api/v1/sessions/fail-short-session");
+    const finalBody = await final.json() as {
+      session: { messages: Array<{ role: string; content: string }> };
+    };
+    expect(finalBody.session.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+    expect(
+      finalBody.session.messages.filter((message) => message.role === "user" && message.content === instruction),
+    ).toHaveLength(1);
+    expect(finalBody.session.messages[1]?.content).toContain("short upstream failed");
+  });
+
+  it("rejects a second confirmed production task with 409 while one is still running", async () => {
+    let resolveInitBook!: () => void;
+    initBookMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveInitBook = resolve;
+    }));
+    loadBookSessionMock.mockResolvedValue({
+      sessionId: "busy-task-session",
+      bookId: null,
+      sessionKind: "book-create",
+      title: null,
+      messages: [],
+      events: [],
+      draftRounds: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const pendingTask = app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "创建《第一本书》。",
+        sessionId: "busy-task-session",
+        sessionKind: "book-create",
+        actionSource: "button",
+        requestedIntent: "create_book",
+        actionPayload: { createBook: { title: "第一本书", language: "zh" } },
+      }),
+    });
+    await vi.waitFor(async () => {
+      const task = await loadStudioTaskSnapshot(root, "busy-task-session");
+      expect(task?.execution.status).toBe("running");
+    });
+
+    const second = await app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "创建《第二本书》。",
+        sessionId: "busy-task-session",
+        sessionKind: "book-create",
+        actionSource: "button",
+        requestedIntent: "create_book",
+        actionPayload: { createBook: { title: "第二本书", language: "zh" } },
+      }),
+    });
+
+    expect(second.status).toBe(409);
+    await expect(second.json()).resolves.toMatchObject({
+      error: {
+        code: "PRODUCTION_TASK_ALREADY_RUNNING",
+        message: expect.stringContaining("生产任务"),
+      },
+    });
+    // 第二个任务没有真正启动
+    expect(initBookMock).toHaveBeenCalledTimes(1);
+
+    resolveInitBook();
+    await pendingTask;
+    // 第一个任务不受影响，正常完成
+    await expect(loadStudioTaskSnapshot(root, "busy-task-session")).resolves.toMatchObject({
+      execution: { status: "completed" },
+    });
+  });
+
+  it("lets exactly one of two concurrent confirmed requests start and rejects the other with 409", async () => {
+    // 单任务检查曾是"await 读快照 → 之后才 set controller"的 check-then-act：
+    // 两个并发确认请求都能通过检查，双任务同时启动。用 loadBookSession 做
+    // 屏障，让两个请求同时到达检查窗口，验证名额是同步预留的。
+    const sessionRecord = {
+      sessionId: "race-task-session",
+      bookId: null,
+      sessionKind: "book-create",
+      title: null,
+      messages: [],
+      events: [],
+      draftRounds: [],
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    let arrived = 0;
+    let releaseBarrier!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      releaseBarrier = resolve;
+    });
+    loadBookSessionMock.mockImplementation(async () => {
+      arrived += 1;
+      if (arrived === 2) releaseBarrier();
+      await barrier;
+      return sessionRecord;
+    });
+    // 任务本体拖一拍，保证第二个请求做检查时第一个任务还在运行中
+    initBookMock.mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const request = (title: string) => app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: `创建《${title}》。`,
+        sessionId: "race-task-session",
+        sessionKind: "book-create",
+        actionSource: "button",
+        requestedIntent: "create_book",
+        actionPayload: { createBook: { title, language: "zh" } },
+      }),
+    });
+
+    const responses = await Promise.all([request("并发一"), request("并发二")]);
+
+    const statuses = responses.map((response) => response.status).sort();
+    expect(statuses).toEqual([200, 409]);
+    const rejected = responses.find((response) => response.status === 409)!;
+    await expect(rejected.json()).resolves.toMatchObject({
+      error: { code: "PRODUCTION_TASK_ALREADY_RUNNING" },
+    });
+    // 败者的任务没有真正启动
+    expect(initBookMock).toHaveBeenCalledTimes(1);
+    // 胜者的任务不受影响，快照收敛为 completed
+    await expect(loadStudioTaskSnapshot(root, "race-task-session")).resolves.toMatchObject({
+      execution: { status: "completed" },
+    });
+  });
+
+  it("tells the chat agent about the running production task without touching the user instruction", async () => {
+    let resolveInitBook!: () => void;
+    initBookMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveInitBook = resolve;
+    }));
+    loadBookSessionMock.mockResolvedValue({
+      sessionId: "parallel-chat-session",
+      bookId: null,
+      sessionKind: "book-create",
+      title: null,
+      messages: [],
+      events: [],
+      draftRounds: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    runAgentSessionMock.mockResolvedValueOnce({ responseText: "任务还在后台跑。", messages: [] });
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const pendingTask = app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "创建《并行验证》。",
+        sessionId: "parallel-chat-session",
+        sessionKind: "book-create",
+        actionSource: "button",
+        requestedIntent: "create_book",
+        actionPayload: { createBook: { title: "并行验证", language: "zh" } },
+      }),
+    });
+    await vi.waitFor(async () => {
+      const task = await loadStudioTaskSnapshot(root, "parallel-chat-session");
+      expect(task?.execution.status).toBe("running");
+    });
+
+    const chatResponse = await app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "现在在写吗？",
+        sessionId: "parallel-chat-session",
+        sessionKind: "book-create",
+      }),
+    });
+
+    expect(chatResponse.status).toBe(200);
+    const agentCall = runAgentSessionMock.mock.calls.at(-1);
+    const config = agentCall?.[0] as { backgroundTaskContext?: string; suppressProductionTools?: boolean };
+    // 任务状态块注入到了 agent 上下文（含任务名和运行状态），用户指令原样传递
+    expect(config.backgroundTaskContext).toContain("建书");
+    expect(config.backgroundTaskContext).toContain("运行中");
+    // 任务运行期间聊天 agent 的生产工具被 host 侧禁用，提示词同步说明
+    expect(config.backgroundTaskContext).toContain("生产类工具已临时不可用");
+    expect(config.suppressProductionTools).toBe(true);
+    expect(agentCall?.[1]).toBe("现在在写吗？");
+
+    resolveInitBook();
+    await pendingTask;
+
+    // 任务结束后：新一轮聊天不再禁用生产工具，也不再注入任务状态块
+    runAgentSessionMock.mockResolvedValueOnce({ responseText: "任务已经完成。", messages: [] });
+    const afterTask = await app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "现在还在写吗？",
+        sessionId: "parallel-chat-session",
+        sessionKind: "book-create",
+      }),
+    });
+    expect(afterTask.status).toBe(200);
+    const afterConfig = runAgentSessionMock.mock.calls.at(-1)?.[0] as {
+      backgroundTaskContext?: string;
+      suppressProductionTools?: boolean;
+    };
+    expect(afterConfig.backgroundTaskContext).toBeUndefined();
+    expect(afterConfig.suppressProductionTools).toBeFalsy();
+  });
+
+  it("tags task pipeline log broadcasts with the execution id while chat round logs stay untagged", async () => {
+    let resolveInitBook!: () => void;
+    initBookMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      resolveInitBook = resolve;
+    }));
+    loadBookSessionMock.mockResolvedValue({
+      sessionId: "tagged-log-session",
+      bookId: null,
+      sessionKind: "book-create",
+      title: null,
+      messages: [],
+      events: [],
+      draftRounds: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    const core = await import("@actalk/inkos-core");
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    // 通过 /api/v1/events 订阅 SSE，收集服务端 broadcast 出来的事件。
+    const sseResponse = await app.request("http://localhost/api/v1/events");
+    const sseEvents: Array<{ event: string; data: Record<string, unknown> | null }> = [];
+    const sseReader = sseResponse.body!.getReader();
+    const ssePump = (async () => {
+      const decoder = new TextDecoder();
+      let buffer = "";
+      try {
+        for (;;) {
+          const { done, value } = await sseReader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let frameEnd = buffer.indexOf("\n\n");
+          while (frameEnd !== -1) {
+            const lines = buffer.slice(0, frameEnd).split("\n");
+            buffer = buffer.slice(frameEnd + 2);
+            const eventName = lines.find((line) => line.startsWith("event:"))?.slice("event:".length).trim();
+            const dataRaw = lines.find((line) => line.startsWith("data:"))?.slice("data:".length).trim();
+            if (eventName) {
+              sseEvents.push({ event: eventName, data: dataRaw ? JSON.parse(dataRaw) as Record<string, unknown> : null });
+            }
+            frameEnd = buffer.indexOf("\n\n");
+          }
+        }
+      } catch {
+        // abort 断开 SSE 连接时 read 会抛错，这是本测试收尾的正常关闭路径
+      }
+    })();
+    await vi.waitFor(() => expect(sseEvents.some((entry) => entry.event === "ping")).toBe(true));
+
+    // 把最近一次 buildPipelineConfig 传给 createLogger 的每个 sink 各写一条日志，
+    // 模拟 pipeline 运行期间经 logger 广播日志的真实路径（createLogger 本身被
+    // mock 成不分发，所以直接写 sink）。
+    const emitLatestPipelineLog = (message: string) => {
+      const createLoggerArgs = vi.mocked(core.createLogger).mock.calls.at(-1)?.[0] as
+        | { sinks?: ReadonlyArray<{ write: (entry: { level: "info"; tag: string; message: string }) => void }> }
+        | undefined;
+      expect(createLoggerArgs?.sinks?.length ?? 0).toBeGreaterThan(0);
+      for (const sink of createLoggerArgs!.sinks!) {
+        sink.write({ level: "info", tag: "studio", message });
+      }
+    };
+    const findLogEvent = (message: string) =>
+      sseEvents.find((entry) => entry.event === "log" && entry.data?.message === message);
+
+    const pendingTask = app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "创建《日志打标验证》。",
+        sessionId: "tagged-log-session",
+        sessionKind: "book-create",
+        actionSource: "button",
+        requestedIntent: "create_book",
+        actionPayload: { createBook: { title: "日志打标验证", language: "zh" } },
+      }),
+    });
+    await vi.waitFor(async () => {
+      const task = await loadStudioTaskSnapshot(root, "tagged-log-session");
+      expect(task?.execution.status).toBe("running");
+    });
+    const runningTask = await loadStudioTaskSnapshot(root, "tagged-log-session");
+    const executionId = runningTask!.execution.id;
+    expect(executionId).toMatch(/^direct-create_book-/);
+
+    // 任务运行期间：任务 pipeline 广播的 log 与 llm:progress 都带任务的 execution id
+    emitLatestPipelineLog("任务运行中的日志");
+    (pipelineConfigs.at(-1) as {
+      onStreamProgress?: (progress: { status: string; elapsedMs: number; totalChars: number; chineseChars: number }) => void;
+    }).onStreamProgress?.({ status: "writing", elapsedMs: 1200, totalChars: 800, chineseChars: 640 });
+    await vi.waitFor(() => expect(findLogEvent("任务运行中的日志")).toBeDefined());
+    expect(findLogEvent("任务运行中的日志")?.data).toMatchObject({
+      sessionId: "tagged-log-session",
+      executionId,
+    });
+    await vi.waitFor(() => expect(sseEvents.some((entry) => entry.event === "llm:progress")).toBe(true));
+    expect(sseEvents.find((entry) => entry.event === "llm:progress")?.data).toMatchObject({
+      sessionId: "tagged-log-session",
+      executionId,
+    });
+
+    // 任务运行期间的并行聊天轮：聊天 pipeline 广播的日志只带 sessionId，不带任务 id
+    runAgentSessionMock.mockImplementationOnce(async () => {
+      emitLatestPipelineLog("并行聊天轮的日志");
+      return { responseText: "任务还在后台跑。", messages: [] };
+    });
+    const chatDuringTask = await app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "现在在写吗？",
+        sessionId: "tagged-log-session",
+        sessionKind: "book-create",
+      }),
+    });
+    expect(chatDuringTask.status).toBe(200);
+    await vi.waitFor(() => expect(findLogEvent("并行聊天轮的日志")).toBeDefined());
+    const parallelChatLog = findLogEvent("并行聊天轮的日志")!.data!;
+    expect(parallelChatLog.sessionId).toBe("tagged-log-session");
+    expect(parallelChatLog.executionId).toBeUndefined();
+
+    resolveInitBook();
+    const taskResponse = await pendingTask;
+    expect(taskResponse.status).toBe(200);
+
+    // 任务结束后：同会话新一轮聊天的日志同样不带已结束任务的 execution id
+    runAgentSessionMock.mockImplementationOnce(async () => {
+      emitLatestPipelineLog("任务结束后的日志");
+      return { responseText: "任务已经完成。", messages: [] };
+    });
+    const chatAfterTask = await app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "刚才那个任务怎么样了？",
+        sessionId: "tagged-log-session",
+        sessionKind: "book-create",
+      }),
+    });
+    expect(chatAfterTask.status).toBe(200);
+    await vi.waitFor(() => expect(findLogEvent("任务结束后的日志")).toBeDefined());
+    expect(findLogEvent("任务结束后的日志")!.data!.executionId).toBeUndefined();
+
+    // 取消 body reader 会触发 hono 流的 abort（Node 下请求 signal 不会），
+    // 由它清掉 keepAlive 定时器并把订阅者从 broadcast 集合移除。
+    await sseReader.cancel();
+    await ssePump;
+  }, 60_000);
+
+  it("marks confirmed production tool:start broadcasts as background while chat tool starts stay untagged", async () => {
+    loadBookSessionMock.mockResolvedValue({
+      sessionId: "bg-flag-session",
+      bookId: null,
+      sessionKind: "short",
+      title: null,
+      messages: [],
+      events: [],
+      draftRounds: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const sseResponse = await app.request("http://localhost/api/v1/events");
+    const sseEvents: Array<{ event: string; data: Record<string, unknown> | null }> = [];
+    const sseReader = sseResponse.body!.getReader();
+    const ssePump = (async () => {
+      const decoder = new TextDecoder();
+      let buffer = "";
+      try {
+        for (;;) {
+          const { done, value } = await sseReader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let frameEnd = buffer.indexOf("\n\n");
+          while (frameEnd !== -1) {
+            const lines = buffer.slice(0, frameEnd).split("\n");
+            buffer = buffer.slice(frameEnd + 2);
+            const eventName = lines.find((line) => line.startsWith("event:"))?.slice("event:".length).trim();
+            const dataRaw = lines.find((line) => line.startsWith("data:"))?.slice("data:".length).trim();
+            if (eventName) {
+              sseEvents.push({ event: eventName, data: dataRaw ? JSON.parse(dataRaw) as Record<string, unknown> : null });
+            }
+            frameEnd = buffer.indexOf("\n\n");
+          }
+        }
+      } catch {
+        // abort 断开 SSE 连接时 read 会抛错，这是本测试收尾的正常关闭路径
+      }
+    })();
+    await vi.waitFor(() => expect(sseEvents.some((entry) => entry.event === "ping")).toBe(true));
+
+    // 确认式生产任务分支：tool:start 必须带 background 标记，前端据此把
+    // free-text 命中任务分支的聊天轮重分类为任务轮。
+    const taskResponse = await app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "写一篇冷库账本短篇。",
+        sessionId: "bg-flag-session",
+        sessionKind: "short",
+        actionSource: "button",
+        requestedIntent: "short_run",
+        actionPayload: { shortRun: { direction: "冷库账本悬疑", cover: false } },
+      }),
+    });
+    expect(taskResponse.status).toBe(200);
+    const findToolStart = (predicate: (data: Record<string, unknown>) => boolean) =>
+      sseEvents.find((entry) => entry.event === "tool:start" && entry.data !== null && predicate(entry.data));
+    await vi.waitFor(() => {
+      expect(findToolStart((data) => String(data.id ?? "").startsWith("direct-short_run-"))).toBeDefined();
+    });
+    expect(findToolStart((data) => String(data.id ?? "").startsWith("direct-short_run-"))?.data).toMatchObject({
+      sessionId: "bg-flag-session",
+      background: true,
+    });
+
+    // 聊天轮工具的 tool:start 不带 background 标记，前端维持聊天轮分类。
+    runAgentSessionMock.mockImplementationOnce(async (config: { onEvent?: (event: unknown) => void }) => {
+      config.onEvent?.({ type: "tool_execution_start", toolCallId: "chat-tool-1", toolName: "read", args: {} });
+      return { responseText: "读完了。", messages: [] };
+    });
+    const chatResponse = await app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "帮我读一下大纲。",
+        sessionId: "bg-flag-session",
+        sessionKind: "short",
+      }),
+    });
+    expect(chatResponse.status).toBe(200);
+    await vi.waitFor(() => expect(findToolStart((data) => data.id === "chat-tool-1")).toBeDefined());
+    expect(findToolStart((data) => data.id === "chat-tool-1")?.data?.background).toBeUndefined();
+
+    await sseReader.cancel();
+    await ssePump;
+  });
+
+  it("aborts only the chat round when scope=chat and leaves the production task controller alive", async () => {
+    let resolveRun!: () => void;
+    let capturedSignal: AbortSignal | undefined;
+    createShortFictionRunToolMock.mockImplementationOnce(() => ({
+      name: "short_fiction_run",
+      execute: vi.fn(async (_id: string, _params: unknown, signal: AbortSignal) => {
+        capturedSignal = signal;
+        await new Promise<void>((resolve) => {
+          resolveRun = resolve;
+        });
+        return {
+          content: [{ type: "text", text: "Short fiction completed." }],
+          details: { kind: "short_fiction_created", storyId: "scoped-short" },
+        };
+      }),
+    }));
+    loadBookSessionMock.mockResolvedValue({
+      sessionId: "chat-scope-session",
+      bookId: null,
+      sessionKind: "short",
+      title: null,
+      messages: [],
+      events: [],
+      draftRounds: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    abortAgentSessionMock.mockReturnValue(true);
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const pendingTask = app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "写一篇冷库账本短篇。",
+        sessionId: "chat-scope-session",
+        sessionKind: "short",
+        actionSource: "button",
+        requestedIntent: "short_run",
+        actionPayload: { shortRun: { direction: "冷库账本悬疑", cover: false } },
+      }),
+    });
+    await vi.waitFor(() => expect(capturedSignal).toBeDefined());
+
+    const chatAbort = await app.request("http://localhost/api/v1/sessions/chat-scope-session/abort", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scope: "chat" }),
+    });
+
+    expect(chatAbort.status).toBe(200);
+    expect(abortAgentSessionMock).toHaveBeenCalledWith(root, "chat-scope-session");
+    // scope=chat 不触发任务控制器的 abort
+    expect(capturedSignal?.aborted).toBe(false);
+
+    // 默认（不带 scope）保持旧行为：任务控制器一起中止
+    const fullAbort = await app.request("http://localhost/api/v1/sessions/chat-scope-session/abort", {
+      method: "POST",
+    });
+    expect(fullAbort.status).toBe(200);
+    expect(capturedSignal?.aborted).toBe(true);
+
+    resolveRun();
+    await pendingTask;
+  });
+
+  it("aborts the running production task and drops its snapshot when the session is deleted", async () => {
+    // 用真实 transcript / 真实删除验证文件层行为：删除会话后，任务收尾的
+    // 助手消息追加不能把 transcript 文件和 sessions 目录条目重建出来。
+    const actual = await wireRealSessionTranscript();
+    deleteBookSessionMock.mockImplementation(
+      (projectRoot: string, sessionId: string) => actual.deleteBookSession(projectRoot, sessionId),
+    );
+    await actual.createAndPersistBookSession(root, null, "deleted-task-session", "short");
+    let capturedSignal: AbortSignal | undefined;
+    createShortFictionRunToolMock.mockImplementationOnce(() => ({
+      name: "short_fiction_run",
+      execute: vi.fn(async (_id: string, _params: unknown, signal: AbortSignal) => {
+        capturedSignal = signal;
+        // 模拟真实 pipeline：任务挂起，直到中止信号到来才在检查点抛出中止错误
+        await new Promise<never>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(new Error("This operation was aborted")));
+        });
+        return { content: [{ type: "text", text: "unreachable" }] };
+      }),
+    }));
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const pendingTask = app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "写一篇冷库账本短篇。",
+        sessionId: "deleted-task-session",
+        sessionKind: "short",
+        actionSource: "button",
+        requestedIntent: "short_run",
+        actionPayload: { shortRun: { direction: "冷库账本悬疑", cover: false } },
+      }),
+    });
+    await vi.waitFor(async () => {
+      const task = await loadStudioTaskSnapshot(root, "deleted-task-session");
+      expect(task?.execution.status).toBe("running");
+    });
+
+    const deleteResponse = await app.request("http://localhost/api/v1/sessions/deleted-task-session", {
+      method: "DELETE",
+    });
+
+    expect(deleteResponse.status).toBe(200);
+    // 删除会话必须同时中止它的生产任务
+    expect(capturedSignal?.aborted).toBe(true);
+
+    // 等任务的错误路径走完：中止后的错误持久化不能把已删除会话的快照重建出来
+    const response = await pendingTask;
+    expect(response.status).toBeGreaterThanOrEqual(400);
+    await expect(access(studioTaskSnapshotPath(root, "deleted-task-session"))).rejects.toThrow();
+    // 任务失败路径的助手消息追加也不能把已删除会话的 transcript 文件与
+    // sessions 目录条目重建出来（appendTranscriptEvents 底层是 mkdir+appendFile）
+    await expect(access(actual.transcriptPath(root, "deleted-task-session"))).rejects.toThrow();
+    await expect(actual.loadBookSession(root, "deleted-task-session")).resolves.toBeNull();
+  });
+
+  // 制造"controller 已注册、磁盘还没有任务快照"的窗口：任务开始时预写用户
+  // 指令的第一次 appendManualSessionMessages 挂起，此时确认分支已同步注册
+  // AbortController，但首次快照持久化（在 executeConfirmedProductionAction
+  // 内部）还没执行。
+  function taskInPersistWindow(sessionId: string): {
+    releaseInstructionAppend: () => void;
+    getCapturedSignal: () => AbortSignal | undefined;
+  } {
+    let releaseInstructionAppend!: () => void;
+    const instructionGate = new Promise<void>((resolve) => {
+      releaseInstructionAppend = resolve;
+    });
+    appendManualSessionMessagesMock.mockImplementationOnce(async () => {
+      await instructionGate;
+    });
+    let capturedSignal: AbortSignal | undefined;
+    createShortFictionRunToolMock.mockImplementationOnce(() => ({
+      name: "short_fiction_run",
+      execute: vi.fn(async (_id: string, _params: unknown, signal: AbortSignal) => {
+        capturedSignal = signal;
+        signal.throwIfAborted();
+        return { content: [{ type: "text", text: "窗口外完成（不应到达）" }] };
+      }),
+    }));
+    loadBookSessionMock.mockResolvedValue({
+      sessionId,
+      bookId: null,
+      sessionKind: "short",
+      title: null,
+      messages: [],
+      events: [],
+      draftRounds: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    return { releaseInstructionAppend, getCapturedSignal: () => capturedSignal };
+  }
+
+  function startShortRunTask(
+    app: { request: (input: string, init?: RequestInit) => Response | Promise<Response> },
+    sessionId: string,
+  ): Promise<Response> {
+    return Promise.resolve(app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "写一篇冷库账本短篇。",
+        sessionId,
+        sessionKind: "short",
+        actionSource: "button",
+        requestedIntent: "short_run",
+        actionPayload: { shortRun: { direction: "冷库账本悬疑", cover: false } },
+      }),
+    }));
+  }
+
+  it("aborts a just-started task from memory before its first snapshot persists", async () => {
+    const window = taskInPersistWindow("window-abort-session");
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const pendingTask = startShortRunTask(app, "window-abort-session");
+    await vi.waitFor(() => expect(appendManualSessionMessagesMock).toHaveBeenCalled());
+    // 窗口成立：controller 已注册，但磁盘上还没有任务快照
+    await expect(loadStudioTaskSnapshot(root, "window-abort-session")).resolves.toBeNull();
+
+    // 窗口内中止：必须从内存拿到任务控制器，不能依赖磁盘快照
+    const abortResponse = await app.request("http://localhost/api/v1/sessions/window-abort-session/abort", {
+      method: "POST",
+    });
+    expect(abortResponse.status).toBe(200);
+    await expect(abortResponse.json()).resolves.toMatchObject({ ok: true, aborted: true });
+
+    window.releaseInstructionAppend();
+    const response = await pendingTask;
+    expect(response.status).toBeGreaterThanOrEqual(400);
+    expect(window.getCapturedSignal()?.aborted).toBe(true);
+  });
+
+  it("aborts a just-started task from memory when its session is deleted before the first snapshot persists", async () => {
+    const window = taskInPersistWindow("window-delete-session");
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const pendingTask = startShortRunTask(app, "window-delete-session");
+    await vi.waitFor(() => expect(appendManualSessionMessagesMock).toHaveBeenCalled());
+    await expect(loadStudioTaskSnapshot(root, "window-delete-session")).resolves.toBeNull();
+
+    const deleteResponse = await app.request("http://localhost/api/v1/sessions/window-delete-session", {
+      method: "DELETE",
+    });
+    expect(deleteResponse.status).toBe(200);
+
+    window.releaseInstructionAppend();
+    const response = await pendingTask;
+    // 删除会话必须中止窗口内刚启动的任务
+    expect(response.status).toBeGreaterThanOrEqual(400);
+    expect(window.getCapturedSignal()?.aborted).toBe(true);
+    // 已删除会话的快照不会被任务的后续持久化重建出来
+    await expect(access(studioTaskSnapshotPath(root, "window-delete-session"))).rejects.toThrow();
+  });
+
   it("executes confirmed play-start action directly without asking the chat model to call tools", async () => {
     const playSession = {
       sessionId: "play-session-1",
@@ -2918,11 +4039,20 @@ describe("createStudioServer daemon lifecycle", () => {
       },
       session: { sessionId: "play-session-1", sessionKind: "play" },
     });
+    // 任务开始时：指令作为 user 消息预写进 transcript。
+    expect(appendManualSessionMessagesMock).toHaveBeenCalledWith(
+      root,
+      "play-session-1",
+      [expect.objectContaining({ role: "user", content: "确认启动旧档案馆之夜。" })],
+      "确认启动旧档案馆之夜。",
+      { sessionKind: "play" },
+    );
+    // 任务完成时：只补助手工具消息，指令不再重复写入。
     expect(appendManualSessionMessagesMock).toHaveBeenCalledWith(
       root,
       "play-session-1",
       expect.any(Array),
-      "确认启动旧档案馆之夜。",
+      "",
       expect.objectContaining({
         sessionKind: "play",
         legacyDisplay: {
@@ -3025,11 +4155,20 @@ describe("createStudioServer daemon lifecycle", () => {
     });
     expect(writeNextChapterMock).toHaveBeenCalledWith("demo-book");
     expect(runAgentSessionMock).not.toHaveBeenCalled();
+    // 任务开始时：指令作为 user 消息预写进 transcript。
+    expect(appendManualSessionMessagesMock).toHaveBeenCalledWith(
+      root,
+      "agent-session-1",
+      [expect.objectContaining({ role: "user", content: "继续" })],
+      "继续",
+      { sessionKind: "book" },
+    );
+    // 任务完成时：只补助手工具消息，指令不再重复写入。
     expect(appendManualSessionMessagesMock).toHaveBeenCalledWith(
       root,
       "agent-session-1",
       expect.any(Array),
-      "继续",
+      "",
       expect.objectContaining({
         sessionKind: "book",
         legacyDisplay: {
@@ -3083,7 +4222,7 @@ describe("createStudioServer daemon lifecycle", () => {
       root,
       "agent-session-1",
       expect.any(Array),
-      "继续",
+      "",
       expect.objectContaining({
         sessionKind: "book",
         legacyDisplay: {
@@ -3124,6 +4263,159 @@ describe("createStudioServer daemon lifecycle", () => {
     await expect(response.json()).resolves.toMatchObject({
       error: { code: "BOOK_BUSY", message: lockError },
       response: lockError,
+    });
+  });
+
+  it("runs quick-action write-next through the background task system with persisted snapshots", async () => {
+    let resolveWrite!: (value: unknown) => void;
+    writeNextChapterMock.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveWrite = resolve;
+    }));
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const pendingResponse = app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "继续",
+        activeBookId: "demo-book",
+        sessionId: "agent-session-1",
+        sessionKind: "book",
+        actionSource: "quick-action",
+        requestedIntent: "write_next",
+      }),
+    });
+
+    // 写章期间：任务快照已写到磁盘，刷新后能恢复出运行中的任务卡
+    await vi.waitFor(async () => {
+      const task = await loadStudioTaskSnapshot(root, "agent-session-1");
+      expect(task).toMatchObject({
+        requestedIntent: "write_next",
+        execution: { tool: "sub_agent", agent: "writer", status: "running" },
+      });
+    });
+
+    resolveWrite({
+      chapterNumber: 3,
+      title: "Rewritten Chapter",
+      wordCount: 1800,
+      revised: false,
+      status: "ready-for-review",
+      auditResult: { passed: true, issues: [], summary: "rewritten" },
+    });
+    const response = await pendingResponse;
+    const body = await response.json();
+    expect(response.status, JSON.stringify(body)).toBe(200);
+    expect(body.response).toContain("已为 demo-book 完成第 3 章");
+    await expect(loadStudioTaskSnapshot(root, "agent-session-1")).resolves.toMatchObject({
+      execution: {
+        tool: "sub_agent",
+        agent: "writer",
+        status: "completed",
+        completedAt: expect.any(Number),
+      },
+    });
+  });
+
+  it("aborts a running write-next task through POST /abort with the default all scope", async () => {
+    let rejectWrite!: (error: Error) => void;
+    writeNextChapterMock.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      rejectWrite = reject;
+    }));
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const pendingResponse = app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "继续",
+        activeBookId: "demo-book",
+        sessionId: "agent-session-1",
+        sessionKind: "book",
+        actionSource: "quick-action",
+        requestedIntent: "write_next",
+      }),
+    });
+    await vi.waitFor(async () => {
+      const task = await loadStudioTaskSnapshot(root, "agent-session-1");
+      expect(task?.execution.status).toBe("running");
+    });
+
+    const abortResponse = await app.request("http://localhost/api/v1/sessions/agent-session-1/abort", {
+      method: "POST",
+    });
+
+    expect(abortResponse.status).toBe(200);
+    await expect(abortResponse.json()).resolves.toMatchObject({ aborted: true });
+    // 任务控制器的中止信号已经通过 pipeline.runWithAbortSignal 传给了写章流程
+    expect(pipelineAbortSignals.at(-1)?.aborted).toBe(true);
+
+    // 真实 pipeline 会在下一个检查点抛出中止错误，这里手动模拟这次拒绝
+    rejectWrite(new Error("This operation was aborted"));
+    const response = await pendingResponse;
+    expect(response.status).toBeGreaterThanOrEqual(400);
+    await expect(loadStudioTaskSnapshot(root, "agent-session-1")).resolves.toMatchObject({
+      execution: { status: "error", completedAt: expect.any(Number) },
+    });
+  });
+
+  it("rejects a second production task with 409 while write-next is still running", async () => {
+    let resolveWrite!: (value: unknown) => void;
+    writeNextChapterMock.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveWrite = resolve;
+    }));
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const pendingResponse = app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "继续",
+        activeBookId: "demo-book",
+        sessionId: "agent-session-1",
+        sessionKind: "book",
+        actionSource: "quick-action",
+        requestedIntent: "write_next",
+      }),
+    });
+    await vi.waitFor(async () => {
+      const task = await loadStudioTaskSnapshot(root, "agent-session-1");
+      expect(task?.execution.status).toBe("running");
+    });
+
+    const second = await app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "继续",
+        activeBookId: "demo-book",
+        sessionId: "agent-session-1",
+        sessionKind: "book",
+        actionSource: "quick-action",
+        requestedIntent: "write_next",
+      }),
+    });
+
+    expect(second.status).toBe(409);
+    await expect(second.json()).resolves.toMatchObject({
+      error: { code: "PRODUCTION_TASK_ALREADY_RUNNING" },
+    });
+    expect(writeNextChapterMock).toHaveBeenCalledTimes(1);
+
+    resolveWrite({
+      chapterNumber: 3,
+      title: "Rewritten Chapter",
+      wordCount: 1800,
+      revised: false,
+      status: "ready-for-review",
+      auditResult: { passed: true, issues: [], summary: "rewritten" },
+    });
+    await pendingResponse;
+    await expect(loadStudioTaskSnapshot(root, "agent-session-1")).resolves.toMatchObject({
+      execution: { status: "completed" },
     });
   });
 

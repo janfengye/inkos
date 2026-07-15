@@ -25,7 +25,13 @@ import { createPlayDB, type PlayGraphDB } from "../play/play-db-factory.js";
 import { PlayRunner, type PlayOpeningSeedResult, type PlayReplayResult, type PlayStepResult, type PlayVariantRestoreResult } from "../play/play-runner.js";
 import { PlayStore } from "../play/play-store.js";
 import type { AgentContext } from "../agents/base.js";
-import { ActionPayloadSchema, isUsablePlayInitialScene, type ActionPayload } from "../interaction/action-envelope.js";
+import {
+  ActionPayloadSchema,
+  isUsablePlayInitialScene,
+  shortRunCharsPerChapterError,
+  shortRunCharsPerChapterRange,
+  type ActionPayload,
+} from "../interaction/action-envelope.js";
 import { ResearchSearchConfigSchema } from "../models/project.js";
 import { searchWeb } from "../utils/web-search.js";
 
@@ -179,11 +185,17 @@ const ProposeActionParams = Type.Object({
     storyId: Type.Optional(Type.String({
       description: "Optional confirmed output id under shorts/.",
     })),
+    language: Type.Optional(Type.Union([
+      Type.Literal("zh"),
+      Type.Literal("en"),
+    ], { description: "Output language of the short fiction. Fill the language the user asked the story to be written in; it may differ from the conversation language (e.g. a Chinese chat asking for an English short => en). When the user does not name one, it defaults to the conversation language." })),
     chapters: Type.Optional(Type.Number({
       description: "Confirmed complete short chapter count, 12-18.",
     })),
     charsPerChapter: Type.Optional(Type.Number({
-      description: "Confirmed Chinese characters per chapter, 900-1200. Do not put total story length here.",
+      minimum: 600,
+      maximum: 1200,
+      description: "Confirmed per-chapter length in the story language's native unit. zh shorts only accept 900-1200 Chinese characters; en shorts only accept 600-800 English words. Values outside the selected language's range are rejected before the task starts. Do not put total story length here.",
     })),
     cover: Type.Optional(Type.Boolean({
       description: "Whether to attempt cover generation.",
@@ -387,7 +399,10 @@ function compactPlayStartPayload(value: ProposeActionParamsType["playStart"]): N
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
-function proposedActionPayload(params: ProposeActionParamsType): ActionPayload | undefined {
+function proposedActionPayload(
+  params: ProposeActionParamsType,
+  language: "zh" | "en",
+): ActionPayload | undefined {
   const payload: ActionPayload = {};
   if (params.action === "create_book") {
     const createBook = compactObject(params.createBook);
@@ -395,7 +410,7 @@ function proposedActionPayload(params: ProposeActionParamsType): ActionPayload |
   }
   if (params.action === "short_run") {
     const shortRun = compactObject(params.shortRun);
-    if (shortRun) payload.shortRun = shortRun;
+    if (shortRun) payload.shortRun = { language, ...shortRun };
   }
   if (params.action === "play_start") {
     const playStart = compactPlayStartPayload(params.playStart);
@@ -490,7 +505,7 @@ export function createProposeActionTool(
       const isZh = language === "zh";
       const title = params.title?.trim() || proposedActionFallbackTitle(params.action, isZh);
       const summary = params.summary?.trim() || proposedActionFallbackSummary(params.action, isZh);
-      const proposedPayload = validateProposedActionPayload(proposedActionPayload(params));
+      const proposedPayload = validateProposedActionPayload(proposedActionPayload(params, language));
       if (proposedPayload.error) {
         throw new Error(`Invalid proposed action payload: ${proposedPayload.error}`);
       }
@@ -1272,7 +1287,7 @@ const ShortFictionRunParams = Type.Object({
     description: "Target complete short chapter count, 12-18. Default 12.",
   })),
   charsPerChapter: Type.Optional(Type.Number({
-    description: "Per-chapter length in the story language's native unit: 900-1200 Chinese characters (default 1000) for zh, or 600-800 English words (default 650) for en. Do not use total story length here.",
+    description: "Per-chapter length in the story language's native unit: 900-1200 Chinese characters (default 1000) for zh, or 600-800 English words (default 650) for en. Values outside the story language's range are rejected before the pipeline starts. Do not use total story length here.",
   })),
   cover: Type.Optional(Type.Boolean({
     description: "Whether to attempt cover image generation after synopsis and cover prompt. Default true; use false if the user only wants text assets.",
@@ -1296,6 +1311,20 @@ const ShortFictionRunParams = Type.Object({
 
 type ShortFictionRunParamsType = Static<typeof ShortFictionRunParams>;
 
+// 启动 pipeline 之前校验 charsPerChapter 是否落在最终语言的合法区间：
+// 确认卡 payload 在 language 缺省时只能做 600-1200 并集校验，这里能拿到最终
+// 语言（payload.language ?? 会话语言 ?? zh，与 runner 的默认一致），越界立即
+// 抛出带合法范围的双语错误，不让任务开跑后才在 runner 中途失败。
+function assertShortRunCharsPerChapter(
+  value: number | undefined,
+  language: "zh" | "en",
+): void {
+  if (value === undefined) return;
+  const { min, max } = shortRunCharsPerChapterRange(language);
+  if (Number.isInteger(value) && value >= min && value <= max) return;
+  throw new Error(shortRunCharsPerChapterError(value, language));
+}
+
 export function createShortFictionRunTool(
   pipeline: PipelineRunner,
   projectRoot: string,
@@ -1317,30 +1346,38 @@ export function createShortFictionRunTool(
     ): Promise<AgentToolResult<unknown>> {
       const progress = (message: string) => onUpdate?.(textResult(message));
       const shortPayload = options.actionPayload?.shortRun;
-      const result = await runShortFictionProduction({
-        projectRoot,
-        direction: shortPayload?.direction ?? params.direction,
-        runtimes: {
-          planner: pipeline.createAgentContext("short-outline"),
-          outlineReview: pipeline.createAgentContext("short-outline-review"),
-          writer: pipeline.createAgentContext("short-writer"),
-          draftReview: pipeline.createAgentContext("short-draft-review"),
-          revise: pipeline.createAgentContext("short-revise"),
-          package: pipeline.createAgentContext("short-package"),
-        },
-        ...((shortPayload?.reference ?? params.reference) ? { reference: { text: shortPayload?.reference ?? params.reference! } } : {}),
-        storyId: shortPayload?.storyId ?? params.storyId,
-        chapterCount: shortPayload?.chapters ?? params.chapters,
-        charsPerChapter: shortPayload?.charsPerChapter ?? params.charsPerChapter,
-        language: options.language,
-        cover: shortPayload?.cover ?? params.cover,
-        coverBaseUrl: params.coverBaseUrl,
-        coverEndpoint: params.coverEndpoint,
-        coverModel: params.coverModel,
-        coverSize: params.coverSize,
-        coverApiKeyEnv: params.coverApiKeyEnv,
-        onProgress: progress,
-      });
+      const language = shortPayload?.language ?? options.language;
+      const charsPerChapter = shortPayload?.charsPerChapter ?? params.charsPerChapter;
+      assertShortRunCharsPerChapter(charsPerChapter, language ?? "zh");
+      const result = await runPipelineWithAbortSignal(
+        pipeline,
+        _signal,
+        () => runShortFictionProduction({
+          projectRoot,
+          direction: shortPayload?.direction ?? params.direction,
+          runtimes: {
+            planner: pipeline.createAgentContext("short-outline"),
+            outlineReview: pipeline.createAgentContext("short-outline-review"),
+            writer: pipeline.createAgentContext("short-writer"),
+            draftReview: pipeline.createAgentContext("short-draft-review"),
+            revise: pipeline.createAgentContext("short-revise"),
+            package: pipeline.createAgentContext("short-package"),
+          },
+          ...((shortPayload?.reference ?? params.reference) ? { reference: { text: shortPayload?.reference ?? params.reference! } } : {}),
+          storyId: shortPayload?.storyId ?? params.storyId,
+          chapterCount: shortPayload?.chapters ?? params.chapters,
+          charsPerChapter,
+          language,
+          cover: shortPayload?.cover ?? params.cover,
+          coverBaseUrl: params.coverBaseUrl,
+          coverEndpoint: params.coverEndpoint,
+          coverModel: params.coverModel,
+          coverSize: params.coverSize,
+          coverApiKeyEnv: params.coverApiKeyEnv,
+          signal: _signal,
+          onProgress: progress,
+        }),
+      );
 
       return textResult(
         [
@@ -1500,7 +1537,7 @@ export function createScriptCreationTool(
     ): Promise<AgentToolResult<unknown>> {
       const progress = (message: string) => onUpdate?.(textResult(message));
       const payload = options.actionPayload?.scriptCreate;
-      const result = await runScriptCreation({
+      const result = await runPipelineWithAbortSignal(pipeline, _signal, () => runScriptCreation({
         projectRoot,
         runtime: pipeline.createAgentContext("script-creation"),
         title: payload?.title ?? params.title,
@@ -1516,7 +1553,7 @@ export function createScriptCreationTool(
         projectId: payload?.projectId ?? params.projectId,
         outDir: payload?.outDir ?? params.outDir,
         onProgress: progress,
-      });
+      }));
 
       return textResult(
         [
@@ -1591,7 +1628,7 @@ export function createStoryboardCreationTool(
     ): Promise<AgentToolResult<unknown>> {
       const progress = (message: string) => onUpdate?.(textResult(message));
       const payload = options.actionPayload?.storyboardCreate;
-      const result = await runStoryboardCreation({
+      const result = await runPipelineWithAbortSignal(pipeline, _signal, () => runStoryboardCreation({
         projectRoot,
         runtime: pipeline.createAgentContext("storyboard-creation"),
         title: payload?.title ?? params.title,
@@ -1608,7 +1645,7 @@ export function createStoryboardCreationTool(
         projectId: payload?.projectId ?? params.projectId,
         outDir: payload?.outDir ?? params.outDir,
         onProgress: progress,
-      });
+      }));
 
       return textResult(
         [
@@ -1688,7 +1725,7 @@ export function createInteractiveFilmCreationTool(
     ): Promise<AgentToolResult<unknown>> {
       const progress = (message: string) => onUpdate?.(textResult(message));
       const payload = options.actionPayload?.interactiveFilmCreate;
-      const result = await runInteractiveFilmCreation({
+      const result = await runPipelineWithAbortSignal(pipeline, _signal, () => runInteractiveFilmCreation({
         projectRoot,
         runtime: pipeline.createAgentContext("interactive-film-creation"),
         title: payload?.title ?? params.title,
@@ -1706,7 +1743,7 @@ export function createInteractiveFilmCreationTool(
         projectId: payload?.projectId ?? params.projectId,
         outDir: payload?.outDir ?? params.outDir,
         onProgress: progress,
-      });
+      }));
 
       return textResult(
         [
@@ -1796,6 +1833,7 @@ export function createGenerateCoverTool(
         coverModel: params.coverModel,
         coverSize: params.coverSize,
         coverApiKeyEnv: params.coverApiKeyEnv,
+        signal: _signal,
       });
       return textResult(
         [
@@ -1868,6 +1906,7 @@ export function createPlayStartTool(
       _signal?: AbortSignal,
       onUpdate?: AgentToolUpdateCallback,
     ): Promise<AgentToolResult<unknown>> {
+      _signal?.throwIfAborted();
       onUpdate?.(textResult("Starting interactive world..."));
       const playPayload = options.actionPayload?.playStart;
       const store = new PlayStore(projectRoot);
@@ -1936,9 +1975,15 @@ export function createPlayStartTool(
             ctx,
             db,
           });
-          seed = await runner.seedOpening({ sceneText, suggestedActions });
+          seed = await runPipelineWithAbortSignal(
+            pipeline,
+            _signal,
+            () => runner.seedOpening({ sceneText, suggestedActions }),
+          );
+          _signal?.throwIfAborted();
           graph = db.snapshot();
         } catch {
+          _signal?.throwIfAborted();
           // Opening graph seed is a HUD enhancement, not a launch precondition.
           // Starting the world must stay fail-open when a model drifts.
         } finally {

@@ -3,6 +3,7 @@ import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 import { serve } from "@hono/node-server";
 import { gzipSync } from "node:zlib";
+import { randomUUID } from "node:crypto";
 import {
   StateManager,
   PipelineRunner,
@@ -123,6 +124,12 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { isSafeBookId } from "./safety.js";
 import { ApiError } from "./errors.js";
 import { buildStudioBookConfig } from "./book-create.js";
+import {
+  deleteStudioTaskSnapshot,
+  loadStudioTaskSnapshot,
+  saveStudioTaskSnapshot,
+  type StudioTaskSnapshot,
+} from "./task-store.js";
 
 // -- Studio server language (read per request from the project config's `language`) --
 
@@ -210,6 +217,49 @@ function resolveToolLabel(tool: string, agent?: string, lang: StudioLanguage = "
   }
   const label = TOOL_LABELS[tool];
   return label ? pick(lang, label.zh, label.en) : tool;
+}
+
+function formatTaskElapsed(ms: number, lang: StudioLanguage): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes === 0) return pick(lang, `${seconds} 秒`, `${seconds}s`);
+  return pick(lang, `${minutes} 分 ${seconds} 秒`, `${minutes}m ${seconds}s`);
+}
+
+/**
+ * 把正在后台运行的生产任务状态渲染成一段系统提示词附录，注入聊天 agent 的上下文。
+ * 没有这段信息时，用户在任务运行期间问"在写吗"，agent 会答"没有任务在运行"。
+ */
+function buildRunningTaskContextBlock(task: StudioTaskSnapshot, lang: StudioLanguage): string {
+  const exec = task.execution;
+  const elapsed = formatTaskElapsed(Date.now() - exec.startedAt, lang);
+  const status = exec.status === "processing"
+    ? pick(lang, "处理中", "processing")
+    : pick(lang, "运行中", "running");
+  const logsTail = (exec.logs ?? []).slice(-3);
+  const logsBlock = logsTail.length > 0
+    ? `\n${pick(lang, "- 最近日志：", "- Recent logs:")}\n${logsTail.map((line) => `  - ${line}`).join("\n")}`
+    : "";
+  return pick(
+    lang,
+    [
+      "## 后台任务状态",
+      "本会话有一个正在后台运行的生产任务：",
+      `- 任务：${exec.label}（${exec.tool}）`,
+      `- 状态：${status}`,
+      `- 已运行：${elapsed}${logsBlock}`,
+      "该任务在后台独立运行，本轮对话不会打断它。用户询问任务进展时，基于以上信息如实回答。不要再次发起同类生产任务，也不要声称没有任务在运行。生产类工具已临时不可用，任务结束后恢复。",
+    ].join("\n"),
+    [
+      "## Background task status",
+      "A production task is currently running in the background of this session:",
+      `- Task: ${exec.label} (${exec.tool})`,
+      `- Status: ${status}`,
+      `- Elapsed: ${elapsed}${logsBlock}`,
+      "The task runs independently in the background; this chat turn does not interrupt it. When the user asks about its progress, answer truthfully from the information above. Do not start another production task of the same kind, and do not claim that no task is running. Production tools are temporarily unavailable and will be restored when the task finishes.",
+    ].join("\n"),
+  );
 }
 
 function summarizeResult(result: unknown): string {
@@ -842,7 +892,11 @@ function normalizeStudioPlayMode(value: unknown): PlayMode | undefined {
   }
 }
 
-function shouldRunDirectWriteNext(args: {
+// 判断"这次请求要不要把写下一章当成确认式生产任务执行"。
+// 命中的三种来源（显式 write_next intent / free-text 明确写章命令 / 其它来源的
+// 写作指令启发式）全部走确认式任务分支：有 taskId、AbortController、磁盘快照，
+// 可中止、可在刷新后恢复。没有书或不在书籍会话时交给聊天 agent 处理。
+function isWriteNextProductionRequest(args: {
   readonly instruction: string;
   readonly agentBookId: string | null | undefined;
   readonly sessionKind: SessionKind;
@@ -1200,6 +1254,7 @@ interface CollectedToolExec {
   details?: unknown;
   error?: string;
   stages?: Array<{ label: string; status: "pending" | "completed" }>;
+  logs?: string[];
   startedAt: number;
   completedAt?: number;
 }
@@ -1294,6 +1349,88 @@ function toolResultText(result: unknown, lang: StudioLanguage = "zh"): string {
   return text || pick(lang, "已完成。", "Done.");
 }
 
+interface WriteNextChapterToolResult {
+  // 章节写完但审稿未通过时置 true：任务卡按错误态展示，但请求仍以 200 返回结果文本。
+  readonly isError?: boolean;
+  readonly content: ReadonlyArray<{ readonly type: "text"; readonly text: string }>;
+  readonly details: {
+    readonly kind: "chapter_written";
+    readonly bookId: string;
+    readonly chapterNumber: number;
+    readonly title?: string;
+    readonly wordCount: number;
+    readonly status?: string;
+  };
+}
+
+function buildWriteNextResponseText(
+  bookId: string,
+  writeResult: { readonly chapterNumber: number; readonly title?: string; readonly wordCount: number; readonly status?: string },
+  writeNeedsReview: boolean,
+  lang: StudioLanguage,
+): string {
+  const zhResponseText = writeNeedsReview
+    ? [
+        `已为 ${bookId} 写出第 ${writeResult.chapterNumber} 章`,
+        writeResult.title ? `《${writeResult.title}》` : "",
+        `，字数 ${writeResult.wordCount}，但审稿未通过，状态 ${writeResult.status}，需要复核后再继续。`,
+      ].join("")
+    : [
+        `已为 ${bookId} 完成第 ${writeResult.chapterNumber} 章`,
+        writeResult.title ? `《${writeResult.title}》` : "",
+        `，字数 ${writeResult.wordCount}，状态 ${writeResult.status}。`,
+      ].join("");
+  const enChapterRef = writeResult.title
+    ? `chapter ${writeResult.chapterNumber} "${writeResult.title}"`
+    : `chapter ${writeResult.chapterNumber}`;
+  const enResponseText = writeNeedsReview
+    ? `Wrote ${enChapterRef} for ${bookId}: ${writeResult.wordCount} words, but the review did not pass (status: ${writeResult.status}). Manual review is required before continuing.`
+    : `Completed ${enChapterRef} for ${bookId}: ${writeResult.wordCount} words, status ${writeResult.status}.`;
+  return pick(lang, zhResponseText, enResponseText);
+}
+
+// 写下一章的确认式任务工具：走 pipeline.runWithAbortSignal，让任务控制器的
+// 中止信号传进写作流程（pipeline 在下一个检查点抛出中止错误）。
+function createWriteNextChapterTool(
+  pipeline: PipelineRunner,
+  bookId: string,
+  lang: StudioLanguage,
+): {
+  readonly name: "sub_agent";
+  readonly execute: (
+    toolCallId: string,
+    params: Record<string, unknown>,
+    signal: AbortSignal | undefined,
+    onUpdate?: (partialResult: unknown) => void,
+  ) => Promise<WriteNextChapterToolResult>;
+} {
+  return {
+    name: "sub_agent",
+    async execute(_toolCallId, _params, signal, onUpdate) {
+      onUpdate?.({
+        content: [{
+          type: "text",
+          text: pick(lang, `正在为 ${bookId} 写下一章…`, `Writing the next chapter for ${bookId}...`),
+        }],
+      });
+      const writeResult = await pipeline.runWithAbortSignal(signal, () => pipeline.writeNextChapter(bookId));
+      const writeNeedsReview = Boolean(writeResult.status && writeResult.status !== "ready-for-review");
+      return {
+        ...(writeNeedsReview ? { isError: true } : {}),
+        content: [{ type: "text", text: buildWriteNextResponseText(bookId, writeResult, writeNeedsReview, lang) }],
+        details: {
+          kind: "chapter_written",
+          bookId,
+          chapterNumber: writeResult.chapterNumber,
+          title: writeResult.title,
+          wordCount: writeResult.wordCount,
+          status: writeResult.status,
+        },
+      };
+    },
+  };
+}
+
 async function executeConfirmedProductionAction(args: {
   readonly pipeline: PipelineRunner;
   readonly root: string;
@@ -1305,9 +1442,12 @@ async function executeConfirmedProductionAction(args: {
   readonly actionPayload?: ActionPayload;
   readonly playMode?: PlayMode;
   readonly language?: StudioLanguage;
+  readonly taskId: string;
+  readonly signal: AbortSignal;
+  readonly onTaskChange: (exec: CollectedToolExec) => Promise<void>;
 }): Promise<CollectedToolExec> {
   const lang = args.language ?? "zh";
-  const id = `direct-${args.requestedIntent}-${Date.now().toString(36)}`;
+  const id = args.taskId;
   const actionPayload = args.actionPayload;
   let tool: ReturnType<typeof createSubAgentTool>
     | ReturnType<typeof createShortFictionRunTool>
@@ -1319,7 +1459,8 @@ async function executeConfirmedProductionAction(args: {
     | ReturnType<typeof createPlayStartTool>
     | ReturnType<typeof createDraftStructureTool>
     | ReturnType<typeof createConnectChoiceTool>
-    | ReturnType<typeof createRemoveNodeTool>;
+    | ReturnType<typeof createRemoveNodeTool>
+    | ReturnType<typeof createWriteNextChapterTool>;
   let params: Record<string, unknown>;
   let agent: string | undefined;
 
@@ -1342,7 +1483,7 @@ async function executeConfirmedProductionAction(args: {
     const payload = actionPayload?.shortRun;
     const direction = payload?.direction?.trim() || args.instruction.trim();
     if (!direction) throw new ApiError(400, "CONFIRMED_ACTION_PAYLOAD_INCOMPLETE", pick(lang, "确认短篇缺少方向，请重新生成确认卡。", "The short fiction confirmation is missing a direction. Regenerate the confirmation card."));
-    tool = createShortFictionRunTool(args.pipeline, args.root, { actionPayload });
+    tool = createShortFictionRunTool(args.pipeline, args.root, { actionPayload, language: lang });
     params = {
       direction,
       ...(payload?.reference ? { reference: payload.reference } : {}),
@@ -1351,6 +1492,13 @@ async function executeConfirmedProductionAction(args: {
       ...(payload?.charsPerChapter ? { charsPerChapter: payload.charsPerChapter } : {}),
       ...(payload?.cover !== undefined ? { cover: payload.cover } : {}),
     };
+  } else if (args.requestedIntent === "write_next") {
+    if (!args.bookId) {
+      throw new ApiError(400, "BOOK_ID_REQUIRED", pick(lang, "写下一章需要先打开一本书。", "Writing the next chapter requires an active book."));
+    }
+    tool = createWriteNextChapterTool(args.pipeline, args.bookId, lang);
+    agent = "writer";
+    params = { agent: "writer", bookId: args.bookId };
   } else if (args.requestedIntent === "generate_cover") {
     const payload = actionPayload?.generateCover;
     const title = requirePayloadText(payload?.title, pick(lang, "确认生成封面缺少标题，请重新生成确认卡。", "The cover generation confirmation is missing a title. Regenerate the confirmation card."));
@@ -1365,7 +1513,7 @@ async function executeConfirmedProductionAction(args: {
   } else if (args.requestedIntent === "script_create") {
     const payload = actionPayload?.scriptCreate;
     const title = requirePayloadText(payload?.title, pick(lang, "确认创建剧本缺少标题，请重新生成确认卡。", "The script creation confirmation is missing a title. Regenerate the confirmation card."));
-    tool = createScriptCreationTool(args.pipeline, args.root, { actionPayload });
+    tool = createScriptCreationTool(args.pipeline, args.root, { actionPayload, language: lang });
     params = {
       title,
       instruction: args.instruction,
@@ -1382,7 +1530,7 @@ async function executeConfirmedProductionAction(args: {
   } else if (args.requestedIntent === "storyboard_create") {
     const payload = actionPayload?.storyboardCreate;
     const title = requirePayloadText(payload?.title, pick(lang, "确认创建分镜缺少标题，请重新生成确认卡。", "The storyboard creation confirmation is missing a title. Regenerate the confirmation card."));
-    tool = createStoryboardCreationTool(args.pipeline, args.root, { actionPayload });
+    tool = createStoryboardCreationTool(args.pipeline, args.root, { actionPayload, language: lang });
     params = {
       title,
       instruction: args.instruction,
@@ -1400,7 +1548,7 @@ async function executeConfirmedProductionAction(args: {
   } else if (args.requestedIntent === "interactive_film_create") {
     const payload = actionPayload?.interactiveFilmCreate;
     const title = requirePayloadText(payload?.title, pick(lang, "确认创建互动影游缺少标题，请重新生成确认卡。", "The interactive film confirmation is missing a title. Regenerate the confirmation card."));
-    tool = createInteractiveFilmCreationTool(args.pipeline, args.root, { actionPayload });
+    tool = createInteractiveFilmCreationTool(args.pipeline, args.root, { actionPayload, language: lang });
     params = {
       title,
       instruction: args.instruction,
@@ -1503,39 +1651,47 @@ async function executeConfirmedProductionAction(args: {
     startedAt: Date.now(),
   };
 
+  await args.onTaskChange(exec);
+
+  // background: true 标明这是后台生产任务的工具启动（聊天轮工具不带）。
+  // free-text 命中写章启发式时前端在发送时无法预知这轮会按任务执行，
+  // 收到这个标记后把该轮从聊天轮重分类为任务轮。
   broadcast("tool:start", {
     sessionId: args.streamSessionId,
     id,
     tool: tool.name,
     args: params,
     stages: exec.stages?.map(stage => stage.label),
+    background: true,
   });
 
   try {
     const result = await tool.execute(
       id,
       params as never,
-      undefined,
+      args.signal,
       (partialResult: unknown) => {
-        broadcast("tool:update", {
-          sessionId: args.streamSessionId,
-          tool: tool.name,
-          partialResult,
-        });
+        const progress = toolResultText(partialResult, lang);
+        if (progress) exec.logs = [...(exec.logs ?? []), progress].slice(-80);
+        void args.onTaskChange(exec).catch(() => undefined);
       },
     );
-    exec.status = "completed";
+    // 工具可以在结果里带 isError=true 表示"执行完成但结果需要人工处理"
+    //（如写章完成但审稿未通过）：任务卡按错误态展示，请求仍按成功返回结果文本。
+    const resultIsError = Boolean((result as { isError?: boolean } | null | undefined)?.isError);
+    exec.status = resultIsError ? "error" : "completed";
     exec.completedAt = Date.now();
     exec.result = toolResultText(result, lang);
     exec.details = (result as { details?: unknown } | undefined)?.details;
     exec.stages = exec.stages?.map(stage => ({ ...stage, status: "completed" as const }));
+    await args.onTaskChange(exec);
     broadcast("tool:end", {
       sessionId: args.streamSessionId,
       id,
       tool: tool.name,
       result,
       details: exec.details,
-      isError: false,
+      isError: resultIsError,
     });
     return exec;
   } catch (error) {
@@ -1544,6 +1700,7 @@ async function executeConfirmedProductionAction(args: {
     exec.status = "error";
     exec.completedAt = Date.now();
     exec.error = message;
+    await args.onTaskChange(exec);
     broadcast("tool:end", {
       sessionId: args.streamSessionId,
       id,
@@ -2460,6 +2617,102 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
   const app = new Hono();
   const state = new StateManager(root);
   let cachedConfig = initialConfig;
+  const activeConfirmedTasks = new Map<string, AbortController>();
+  // 确认式生产任务的单任务名额（sessionId → taskId）。原来的检查是"await 读快照
+  // → 之后才 set controller"的 check-then-act：两个并发确认请求都能通过检查，
+  // 双任务同时启动、快照互相覆盖。这里在任何 await 之前同步占位，占位失败的
+  // 请求直接 409；任务结束（成功/失败）后在 finally 释放。
+  // 值记 taskId：controller 注册与首次快照持久化之间有多个 await 间隙，删除/
+  // 中止在这个窗口内从磁盘读不到快照，必须先经内存 sessionId → taskId →
+  // controller 找到刚启动的任务。
+  const reservedProductionSessions = new Map<string, string>();
+  // 已删除会话的 sessionId：删除会话时中止其生产任务，任务随后的错误持久化
+  // 不能把快照文件重新写回来（给已删除的会话"还魂"）。同名会话重新创建时移除标记。
+  const deletedSessionIds = new Set<string>();
+
+  // 已删除会话不再追加 transcript 消息：appendManualSessionMessages 底层的
+  // appendTranscriptEvents 是 mkdir + appendFile，会把已删除会话的 sessions
+  // 目录条目和 transcript 文件重建出来（任务成功/失败的收尾追加正好落在删除
+  // 之后）。所有手动追加统一走这个守卫。
+  const appendSessionMessagesUnlessDeleted: typeof appendManualSessionMessages = async (
+    projectRoot,
+    sessionId,
+    messages,
+    input,
+    options,
+  ) => {
+    if (deletedSessionIds.has(sessionId)) return;
+    await appendManualSessionMessages(projectRoot, sessionId, messages, input, options);
+  };
+
+  const persistConfirmedTask = async (
+    sessionId: string,
+    requestedIntent: RequestedIntent,
+    exec: CollectedToolExec,
+  ): Promise<void> => {
+    if (deletedSessionIds.has(sessionId)) return;
+    const snapshot: StudioTaskSnapshot = {
+      version: 1,
+      sessionId,
+      requestedIntent,
+      updatedAt: Date.now(),
+      execution: {
+        ...exec,
+        ...(exec.stages ? { stages: exec.stages.map((stage) => ({ ...stage })) } : {}),
+        ...(exec.logs ? { logs: [...exec.logs] } : {}),
+      },
+    };
+    await saveStudioTaskSnapshot(root, snapshot);
+  };
+
+  const loadReconciledTaskSnapshot = async (sessionId: string): Promise<StudioTaskSnapshot | null> => {
+    const task = await loadStudioTaskSnapshot(root, sessionId);
+    if (!task) return null;
+    const running = task.execution.status === "running" || task.execution.status === "processing";
+    if (!running || activeConfirmedTasks.has(task.execution.id)) return task;
+    // running 快照但本进程没有对应的 AbortController，只可能是任务运行期间
+    // server 进程退出过（正常流程里 controller 先于首次持久化进入 Map、晚于
+    // 终态持久化删除）。任务本体已随旧进程消失，这里把快照改写为终态并保存，
+    // 否则前端每次刷新都会恢复出一个永远运行中的任务卡，停止按钮也无法终结它。
+    const lang = await currentProjectLanguage();
+    const completedAt = Date.now();
+    const reconciled: StudioTaskSnapshot = {
+      ...task,
+      updatedAt: completedAt,
+      execution: {
+        ...task.execution,
+        status: "error",
+        error: pick(
+          lang,
+          "任务已中断：Studio 服务在任务运行期间重启，任务未能继续。请重新发起。",
+          "Task interrupted: the Studio server restarted while this task was running. Please start it again.",
+        ),
+        completedAt,
+      },
+    };
+    await saveStudioTaskSnapshot(root, reconciled);
+    return reconciled;
+  };
+
+  // 判断"该会话是否真有生产任务在跑"的唯一入口：
+  // 对账后的快照是 running/processing，且本进程还持有对应的 AbortController。
+  const findActiveRunningTask = async (sessionId: string): Promise<StudioTaskSnapshot | null> => {
+    const task = await loadReconciledTaskSnapshot(sessionId);
+    if (!task) return null;
+    const running = task.execution.status === "running" || task.execution.status === "processing";
+    return running && activeConfirmedTasks.has(task.execution.id) ? task : null;
+  };
+
+  // 找该会话正在运行的任务控制器：优先查内存（预留表 sessionId → taskId →
+  // controller），磁盘快照只作回退。controller 注册与首次快照持久化之间有多个
+  // await 间隙，窗口内删除/中止只靠磁盘快照会漏掉刚启动的任务。
+  const findRunningTaskController = async (sessionId: string): Promise<AbortController | undefined> => {
+    const reservedTaskId = reservedProductionSessions.get(sessionId);
+    const reserved = reservedTaskId ? activeConfirmedTasks.get(reservedTaskId) : undefined;
+    if (reserved) return reserved;
+    const task = await loadReconciledTaskSnapshot(sessionId);
+    return task ? activeConfirmedTasks.get(task.execution.id) : undefined;
+  };
 
   app.use("/*", cors());
 
@@ -2532,6 +2785,11 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     overrides?: Partial<Pick<PipelineConfig, "externalContext" | "client" | "model">> & {
       readonly currentConfig?: ProjectConfig;
       readonly sessionIdForSSE?: string;
+      // 确认式生产任务的 execution id。给任务构建 pipeline 时传入，该 pipeline
+      // 广播的 log / llm:progress / context:compression 事件都会带上 executionId，
+      // 前端据此把事件精确附加到任务卡；同会话聊天轮构建的 pipeline 不传，
+      // 事件维持只带 sessionId，走"最近一张运行中卡"的回退。
+      readonly executionIdForSSE?: string;
       readonly bookIdForSettings?: string;
     },
   ): Promise<PipelineConfig> {
@@ -2540,11 +2798,15 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     const chapterReviewMode = await resolveBookChapterReviewMode(root, overrides?.bookIdForSettings, projectReviewMode);
     const projectRevisionGate = readProjectRevisionGate(currentConfig as unknown as Record<string, unknown>);
     const revisionGate = await resolveBookRevisionGate(root, overrides?.bookIdForSettings, projectRevisionGate);
+    const sseExecutionTag = overrides?.executionIdForSSE
+      ? { executionId: overrides.executionIdForSSE }
+      : {};
     const scopedSseSink: LogSink = overrides?.sessionIdForSSE
       ? {
           write(entry) {
             broadcast("log", {
               sessionId: overrides.sessionIdForSSE,
+              ...sseExecutionTag,
               level: entry.level,
               tag: entry.tag,
               message: entry.message,
@@ -2568,12 +2830,14 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       onContextCompression: (event) => {
         broadcast("context:compression", {
           ...(overrides?.sessionIdForSSE ? { sessionId: overrides.sessionIdForSSE } : {}),
+          ...sseExecutionTag,
           ...event,
         });
       },
       onStreamProgress: (progress) => {
         broadcast("llm:progress", {
           ...(overrides?.sessionIdForSSE ? { sessionId: overrides.sessionIdForSSE } : {}),
+          ...sseExecutionTag,
           status: progress.status,
           elapsedMs: progress.elapsedMs,
           totalChars: progress.totalChars,
@@ -3069,6 +3333,11 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       };
       subscribers.add(handler);
       await stream.writeSSE({ event: "ping", data: "" });
+      const sessionId = c.req.query("sessionId");
+      if (sessionId) {
+        const task = await loadReconciledTaskSnapshot(sessionId);
+        if (task) await stream.writeSSE({ event: "task:snapshot", data: JSON.stringify(task) });
+      }
 
       // Keep alive
       const keepAlive = setInterval(() => {
@@ -4070,9 +4339,11 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
   });
 
   app.get("/api/v1/sessions/:sessionId", async (c) => {
-    const session = await loadBookSession(root, c.req.param("sessionId"));
+    const sessionId = c.req.param("sessionId");
+    const session = await loadBookSession(root, sessionId);
     if (!session) return c.json({ error: "Session not found" }, 404);
-    return c.json({ session });
+    const task = await loadReconciledTaskSnapshot(sessionId);
+    return c.json({ session, ...(task ? { task } : {}) });
   });
 
   app.post("/api/v1/sessions", async (c) => {
@@ -4093,6 +4364,9 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       sessionKind,
       ...(playMode ? [{ playMode }] as const : []),
     );
+    // 客户端可以用同一个 sessionId 重新创建会话：移除删除标记，
+    // 让新会话的生产任务可以正常持久化快照。
+    deletedSessionIds.delete(session.sessionId);
     return c.json({ session });
   });
 
@@ -4130,13 +4404,32 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
   });
 
   app.delete("/api/v1/sessions/:sessionId", async (c) => {
-    await deleteBookSession(root, c.req.param("sessionId"));
+    const sessionId = c.req.param("sessionId");
+    // 先标记删除，再中止任务：任务被中止后的错误持久化会检查这个标记，
+    // 不会把已删除会话的快照文件重建出来。
+    deletedSessionIds.add(sessionId);
+    const controller = await findRunningTaskController(sessionId);
+    controller?.abort();
+    await Promise.all([
+      deleteBookSession(root, sessionId),
+      deleteStudioTaskSnapshot(root, sessionId),
+    ]);
     return c.json({ ok: true });
   });
 
   app.post("/api/v1/sessions/:sessionId/abort", async (c) => {
     const sessionId = c.req.param("sessionId");
-    const aborted = abortAgentSession(root, sessionId);
+    // scope=chat 只中止当前聊天轮（agent loop），不动后台生产任务的控制器；
+    // 默认 all 维持旧行为：聊天轮和生产任务一起停。
+    const body = await c.req.json<{ scope?: unknown }>().catch(() => ({} as { scope?: unknown }));
+    const scope = body.scope === "chat" ? "chat" : "all";
+    let taskAborted = false;
+    if (scope === "all") {
+      const controller = await findRunningTaskController(sessionId);
+      controller?.abort();
+      taskAborted = Boolean(controller);
+    }
+    const aborted = abortAgentSession(root, sessionId) || taskAborted;
     broadcast("agent:aborted", { sessionId, aborted });
     return c.json({ ok: true, aborted });
   });
@@ -4240,10 +4533,18 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           throw new ApiError(404, "BOOK_NOT_FOUND", `Book not found: ${agentBookId}`);
         }
       }
+      const configLanguage = config.language === "en" ? "en" : "zh";
+      const bookLanguage = activeBookConfig?.language === "en" ? "en" : activeBookConfig?.language === "zh" ? "zh" : undefined;
+      const requestedLanguage = actionPayload?.shortRun?.language ?? actionPayload?.createBook?.language;
+      const surfaceLanguage = agentBookId
+        ? (bookLanguage ?? configLanguage)
+        : (requestedLanguage ?? inferLanguage(instruction));
       const streamSessionId = loadedBookSession.sessionId;
       const titleBeforeRun = bookSession.title;
       let sessionTitleBroadcasted = false;
       const refreshBookSessionFromTranscript = async (): Promise<void> => {
+        // 会话已删除：磁盘上没有 transcript 可刷，也不该再广播它的标题。
+        if (deletedSessionIds.has(bookSession.sessionId)) return;
         const refreshed = await loadBookSession(root, bookSession.sessionId);
         if (refreshed) {
           bookSession = refreshed;
@@ -4263,7 +4564,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           })
         : null;
       if (externalEdit) {
-        await appendManualSessionMessages(root, bookSession.sessionId, [{
+        await appendSessionMessagesUnlessDeleted(root, bookSession.sessionId, [{
           role: "assistant",
           content: [{ type: "text", text: externalEdit.responseText }],
           api: "anthropic-messages",
@@ -4398,28 +4699,89 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
             baseUrl: configuredEntry?.baseUrl ?? "",
           } as any)
         : client;
+      // 确认式生产任务的 intent：写下一章的各种触发方式（quick-action 按钮、
+      // free-text 明确写章命令、写作指令启发式）统一归一成 write_next，与其它
+      // button/slash 确认的生产 intent 走同一条任务分支，获得 taskId、
+      // AbortController、磁盘快照与单任务闸门。
+      const confirmedIntent: RequestedIntent | undefined = isWriteNextProductionRequest({ instruction, agentBookId, sessionKind, actionSource, requestedIntent })
+        ? "write_next"
+        : requestedIntent && isConfirmedProductionAction({ actionSource, requestedIntent })
+          ? requestedIntent
+          : undefined;
+      // 任务的 execution id 在构建 pipeline 之前生成并传入 executionIdForSSE：
+      // 该 pipeline 广播的进度事件（log / llm:progress / context:compression）
+      // 由此带上任务 id。同会话并行聊天轮的 pipeline 是另一次请求单独构建的、
+      // 不带这个 id，前端才能把任务日志与聊天轮工具日志分开归属。
+      const confirmedTaskId = confirmedIntent ? `direct-${confirmedIntent}-${randomUUID()}` : undefined;
+
       const pipeline = new PipelineRunner(await buildPipelineConfig({
         client: pipelineClient,
         model: reqModel ?? config.llm.model,
         currentConfig: config,
         sessionIdForSSE: bookSession.sessionId,
         bookIdForSettings: activeBookId ?? undefined,
+        ...(confirmedTaskId ? { executionIdForSSE: confirmedTaskId } : {}),
       }));
 
-      if (requestedIntent && isConfirmedProductionAction({ actionSource, requestedIntent })) {
-        const pendingBookId = requestedIntent === "create_book" && actionPayload?.createBook?.title
-          ? deriveBookIdFromTitle(actionPayload.createBook.title)
-          : null;
-        if (pendingBookId) {
-          bookCreateStatus.set(pendingBookId, { status: "creating" });
-          broadcast("book:creating", {
-            bookId: pendingBookId,
-            title: actionPayload?.createBook?.title ?? pendingBookId,
-            sessionId: streamSessionId,
-          });
-        }
+      if (confirmedIntent && confirmedTaskId) {
+        const productionTaskBusyResponse = () => {
+          const message = pick(
+            surfaceLanguage,
+            "当前会话已有一个生产任务在运行，请等它完成，或先用停止按钮结束它，再发起新任务。",
+            "A production task is already running in this session. Wait for it to finish, or stop it first, then start a new task.",
+          );
+          return c.json({
+            error: { code: "PRODUCTION_TASK_ALREADY_RUNNING", message },
+            response: message,
+          }, 409);
+        };
 
+        // task-store 每会话只有一个任务快照，不支持并发生产任务。
+        // 名额必须在任何 await 之前同步预留：并发的第二个确认请求在这里 409，
+        // 不会与第一个请求一起通过后面的快照检查（check-then-act 竞态）。
+        // 预留键固定为此刻的 sessionId：后面 bookSession 可能因建书迁移被重新
+        // 赋值，finally 释放的必须是当初预留的那个键。
+        const reservedSessionId = bookSession.sessionId;
+        if (reservedProductionSessions.has(reservedSessionId)) {
+          return productionTaskBusyResponse();
+        }
+        reservedProductionSessions.set(reservedSessionId, confirmedTaskId);
+
+        const taskId = confirmedTaskId;
+        const taskController = new AbortController();
+        activeConfirmedTasks.set(taskId, taskController);
+        let pendingBookId: string | null = null;
         try {
+          // 预留成功后再走快照检查：本进程的任务都会占预留名额，这里防的是
+          // 旧进程遗留的运行中快照（loadReconciledTaskSnapshot 会把它对账成
+          // 终态）等边界情况，保证不覆盖一个仍被认为在运行的任务。
+          const runningTask = await findActiveRunningTask(bookSession.sessionId);
+          if (runningTask) {
+            return productionTaskBusyResponse();
+          }
+
+          pendingBookId = confirmedIntent === "create_book" && actionPayload?.createBook?.title
+            ? deriveBookIdFromTitle(actionPayload.createBook.title)
+            : null;
+          if (pendingBookId) {
+            bookCreateStatus.set(pendingBookId, { status: "creating" });
+            broadcast("book:creating", {
+              bookId: pendingBookId,
+              title: actionPayload?.createBook?.title ?? pendingBookId,
+              sessionId: streamSessionId,
+            });
+          }
+
+          // 任务开始前先把用户指令作为 user 消息写进 transcript：任务运行期间
+          // 刷新页面时，用户气泡能从 transcript 恢复；并行聊天随后写入的消息
+          // 也会按真实时间排在指令之后。完成/失败路径只追加助手工具消息
+          //（instruction 传空字符串），指令不会写第二遍。
+          await appendSessionMessagesUnlessDeleted(root, bookSession.sessionId, [{
+            role: "user",
+            content: instruction,
+            timestamp: Date.now(),
+          }], instruction, { sessionKind });
+
           const exec = await executeConfirmedProductionAction({
             pipeline,
             root,
@@ -4427,9 +4789,12 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
             bookId: agentBookId,
             streamSessionId,
             instruction,
-            requestedIntent,
+            requestedIntent: confirmedIntent,
             actionPayload,
-            language,
+            language: surfaceLanguage,
+            taskId,
+            signal: taskController.signal,
+            onTaskChange: (taskExec) => persistConfirmedTask(bookSession.sessionId, confirmedIntent, taskExec),
             ...(playMode ? { playMode } : {}),
           });
 
@@ -4457,16 +4822,17 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
             }
           }
 
-          const responseText = exec.result ?? pick(language, "已完成。", "Done.");
+          const responseText = exec.result ?? pick(surfaceLanguage, "已完成。", "Done.");
           const responseForUser = suppressManualTextForTool(exec) ? "" : responseText;
-          await appendManualSessionMessages(root, bookSession.sessionId, [
+          // 指令已在任务开始时写入 transcript，这里只补助手工具消息。
+          await appendSessionMessagesUnlessDeleted(root, bookSession.sessionId, [
             manualToolAssistantMessage(
               responseText,
               exec,
               configuredEntry?.service ?? reqService ?? config.llm.provider,
               reqModel ?? config.llm.model,
             ),
-          ], instruction, manualToolAppendOptions(sessionKind, exec));
+          ], "", manualToolAppendOptions(sessionKind, exec));
           await refreshBookSessionFromTranscript();
           broadcast("agent:complete", { instruction, activeBookId: createdBookId ?? agentBookId, sessionId: bookSession.sessionId, sessionKind });
           return c.json({
@@ -4480,20 +4846,21 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
           });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          const failure = formatAgentActionFailure(message, language);
+          const failure = formatAgentActionFailure(message, surfaceLanguage);
           if (pendingBookId) {
             bookCreateStatus.set(pendingBookId, { status: "error", error: message });
             broadcast("book:error", { bookId: pendingBookId, sessionId: streamSessionId, error: message });
           }
           if (error instanceof ConfirmedActionExecutionError) {
-            await appendManualSessionMessages(root, bookSession.sessionId, [
+            // 指令已在任务开始时写入 transcript，失败时同样只补助手工具消息。
+            await appendSessionMessagesUnlessDeleted(root, bookSession.sessionId, [
               manualToolAssistantMessage(
                 message,
                 error.exec,
                 configuredEntry?.service ?? reqService ?? config.llm.provider,
                 reqModel ?? config.llm.model,
               ),
-            ], instruction, manualToolAppendOptions(sessionKind, error.exec)).catch(() => undefined);
+            ], "", manualToolAppendOptions(sessionKind, error.exec)).catch(() => undefined);
             await refreshBookSessionFromTranscript().catch(() => undefined);
           }
           broadcast("agent:error", { instruction, activeBookId: agentBookId, sessionId: bookSession.sessionId, sessionKind, error: message });
@@ -4501,130 +4868,9 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
             error: { code: failure.code, message: failure.message },
             response: failure.message,
           }, failure.status);
-        }
-      }
-
-      if (shouldRunDirectWriteNext({ instruction, agentBookId, sessionKind, actionSource, requestedIntent })) {
-        const directWriteBookId = agentBookId;
-        if (!directWriteBookId) {
-          throw new ApiError(400, "BOOK_ID_REQUIRED", "write_next requires an active book");
-        }
-        const toolCallId = `direct-writer-${Date.now().toString(36)}`;
-        const toolArgs = { agent: "writer", bookId: directWriteBookId };
-        broadcast("tool:start", {
-          sessionId: streamSessionId,
-          id: toolCallId,
-          tool: "sub_agent",
-          args: toolArgs,
-          stages: pipelineStages("writer", language),
-        });
-
-        try {
-          const writeResult = await pipeline.writeNextChapter(directWriteBookId);
-          const writeNeedsReview = Boolean(writeResult.status && writeResult.status !== "ready-for-review");
-          const zhResponseText = writeNeedsReview
-            ? [
-                `已为 ${directWriteBookId} 写出第 ${writeResult.chapterNumber} 章`,
-                writeResult.title ? `《${writeResult.title}》` : "",
-                `，字数 ${writeResult.wordCount}，但审稿未通过，状态 ${writeResult.status}，需要复核后再继续。`,
-              ].join("")
-            : [
-                `已为 ${directWriteBookId} 完成第 ${writeResult.chapterNumber} 章`,
-                writeResult.title ? `《${writeResult.title}》` : "",
-                `，字数 ${writeResult.wordCount}，状态 ${writeResult.status}。`,
-              ].join("");
-          const enChapterRef = writeResult.title
-            ? `chapter ${writeResult.chapterNumber} "${writeResult.title}"`
-            : `chapter ${writeResult.chapterNumber}`;
-          const enResponseText = writeNeedsReview
-            ? `Wrote ${enChapterRef} for ${directWriteBookId}: ${writeResult.wordCount} words, but the review did not pass (status: ${writeResult.status}). Manual review is required before continuing.`
-            : `Completed ${enChapterRef} for ${directWriteBookId}: ${writeResult.wordCount} words, status ${writeResult.status}.`;
-          const responseText = pick(language, zhResponseText, enResponseText);
-          const toolResult = {
-            content: [{ type: "text", text: responseText }],
-            details: {
-              kind: "chapter_written",
-              bookId: directWriteBookId,
-              chapterNumber: writeResult.chapterNumber,
-              title: writeResult.title,
-              wordCount: writeResult.wordCount,
-              status: writeResult.status,
-            },
-          };
-          broadcast("tool:end", {
-            sessionId: streamSessionId,
-            id: toolCallId,
-            tool: "sub_agent",
-            result: toolResult,
-            details: toolResult.details,
-            isError: writeNeedsReview,
-          });
-          const exec: CollectedToolExec = {
-            id: toolCallId,
-            tool: "sub_agent",
-            agent: "writer",
-            label: resolveToolLabel("sub_agent", "writer", language),
-            status: writeNeedsReview ? "error" : "completed",
-            args: toolArgs,
-            result: responseText,
-            details: toolResult.details,
-            startedAt: Date.now(),
-            completedAt: Date.now(),
-          };
-          await appendManualSessionMessages(root, bookSession.sessionId, [
-            manualToolAssistantMessage(
-              responseText,
-              exec,
-              configuredEntry?.service ?? reqService ?? config.llm.provider,
-              reqModel ?? config.llm.model,
-            ),
-          ], instruction, manualToolAppendOptions(sessionKind, exec));
-          await refreshBookSessionFromTranscript();
-          broadcast("agent:complete", { instruction, activeBookId: directWriteBookId, sessionId: bookSession.sessionId, sessionKind });
-          return c.json({
-            response: responseText,
-            session: {
-              sessionId: bookSession.sessionId,
-              sessionKind,
-              activeBookId: directWriteBookId,
-            },
-          });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          const failure = formatAgentActionFailure(message, language);
-          const toolResult = { content: [{ type: "text", text: message }] };
-          const exec: CollectedToolExec = {
-            id: toolCallId,
-            tool: "sub_agent",
-            agent: "writer",
-            label: resolveToolLabel("sub_agent", "writer", language),
-            status: "error",
-            args: toolArgs,
-            error: message,
-            startedAt: Date.now(),
-            completedAt: Date.now(),
-          };
-          broadcast("tool:end", {
-            sessionId: streamSessionId,
-            id: toolCallId,
-            tool: "sub_agent",
-            result: toolResult,
-            isError: true,
-          });
-          await appendManualSessionMessages(root, bookSession.sessionId, [
-            manualToolAssistantMessage(
-              message,
-              exec,
-              configuredEntry?.service ?? reqService ?? config.llm.provider,
-              reqModel ?? config.llm.model,
-            ),
-          ], instruction, manualToolAppendOptions(sessionKind, exec)).catch(() => undefined);
-          await refreshBookSessionFromTranscript().catch(() => undefined);
-          broadcast("agent:error", { instruction, activeBookId: agentBookId, sessionId: bookSession.sessionId, sessionKind, error: message });
-          return c.json({
-            error: { code: failure.code, message: failure.message },
-            response: failure.message,
-          }, failure.status);
+        } finally {
+          activeConfirmedTasks.delete(taskId);
+          reservedProductionSessions.delete(reservedSessionId);
         }
       }
 
@@ -4633,17 +4879,24 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
       // from the instruction; committed book/edit sessions keep the configured language.
       // Without this, an English request on a zh-default project gets Chinese replies — and
       // a Chinese play world, because play_start then infers from the rewritten premise.
-      const configLanguage = config.language === "en" ? "en" : "zh";
-      const bookLanguage = activeBookConfig?.language === "en" ? "en" : activeBookConfig?.language === "zh" ? "zh" : undefined;
-      const surfaceLanguage = agentBookId ? (bookLanguage ?? configLanguage) : inferLanguage(instruction);
-
       // Run pi-agent session
+      // 后台生产任务与聊天并行时，把任务状态注入 agent 的系统提示词，
+      // 让模型知道任务仍在运行、能回答进度、且不会重复发起同类任务；
+      // 同时传 suppressProductionTools 在 host 层剔除会修改书籍/产物的
+      // 生产工具（提示词只是软约束）。
+      const backgroundTask = await findActiveRunningTask(bookSession.sessionId);
       const collectedToolExecs: CollectedToolExec[] = [];
       const result = await runAgentSession(
         {
           model,
           apiKey: agentApiKey,
           pipeline,
+          ...(backgroundTask
+            ? {
+                backgroundTaskContext: buildRunningTaskContextBlock(backgroundTask, surfaceLanguage),
+                suppressProductionTools: true,
+              }
+            : {}),
           projectRoot: root,
           bookId: agentBookId,
           sessionKind,
@@ -4710,13 +4963,6 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
                 tool: event.toolName,
                 args,
                 stages,
-              });
-            }
-            if (event.type === "tool_execution_update") {
-              broadcast("tool:update", {
-                sessionId: streamSessionId,
-                tool: event.toolName,
-                partialResult: event.partialResult,
               });
             }
             if (event.type === "tool_execution_end") {

@@ -35,6 +35,7 @@ import {
   Paperclip,
   Gamepad2,
   Palette,
+  RotateCcw,
   Square,
 } from "lucide-react";
 import { Shimmer } from "../components/ai-elements/shimmer";
@@ -414,11 +415,14 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const input = useChatStore((s) => s.input);
   const loading = useChatStore(chatSelectors.isActiveSessionStreaming);
+  const chatStreaming = useChatStore(chatSelectors.isActiveSessionChatStreaming);
+  const lastFailedSend = useChatStore(chatSelectors.activeSessionLastFailedSend);
   const selectedModel = useChatStore((s) => s.selectedModel);
   const selectedService = useChatStore((s) => s.selectedService);
   // -- Store actions --
   const setInput = useChatStore((s) => s.setInput);
   const sendMessage = useChatStore((s) => s.sendMessage);
+  const retryLastSend = useChatStore((s) => s.retryLastSend);
   const abortSession = useChatStore((s) => s.abortSession);
   const setSelectedModel = useChatStore((s) => s.setSelectedModel);
   const loadSessionList = useChatStore((s) => s.loadSessionList);
@@ -709,14 +713,19 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
     if (!activeSessionId) return;
     const hasPendingMessage = Boolean(text.trim()) || attachedFiles.length > 0;
     if (!hasPendingMessage) {
-      if (loading) await abortSession(activeSessionId);
+      // 停止按钮按对象分语义：聊天轮流式中只停聊天轮（后台任务继续跑）；
+      // 只有后台任务在跑时才停任务（旧行为）。
+      if (chatStreaming) await abortSession(activeSessionId, "chat");
+      else if (loading) await abortSession(activeSessionId);
       return;
     }
     const requestedSkills = selectedSkillIdsForSend(selectedSkillIds);
     autoScrollPinnedRef.current = true;
     const attachments = await serializeChatAttachments(attachedFiles);
-    if (loading) {
-      await abortSession(activeSessionId);
+    if (chatStreaming) {
+      // 聊天轮流式中再发消息：先停当前聊天轮（不动后台任务）再发送。
+      // 只有后台任务在跑时直接发送，不中止任务。
+      await abortSession(activeSessionId, "chat");
     }
     await sendMessage(activeSessionId, text, {
       activeBookId,
@@ -1054,6 +1063,25 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
           />
         </div>
       )}
+      {/* 重试上一条失败的聊天消息（issue #335）：只针对聊天轮失败；
+          后台生产任务的失败由任务卡自己展示，不在这里出现。 */}
+      {lastFailedSend && !chatStreaming && activeSessionId ? (
+        <div className={`shrink-0 transition-[padding] duration-200 ${worldPanelInsetClass}`}>
+          <div className="max-w-3xl mx-auto w-full px-4 pb-2">
+            <button
+              type="button"
+              onClick={() => {
+                autoScrollPinnedRef.current = true;
+                void retryLastSend(activeSessionId);
+              }}
+              className="flex items-center gap-1.5 rounded-lg border border-border/50 bg-secondary/30 px-3 py-1.5 text-sm font-medium text-muted-foreground transition-colors hover:border-primary/40 hover:text-primary"
+            >
+              <RotateCcw size={14} />
+              {isZh ? "重试上一条消息" : "Retry last message"}
+            </button>
+          </div>
+        </div>
+      ) : null}
       {needsPlayModeChoice ? null : (
       <div className={`shrink-0 border-t border-border/40 px-4 py-3 transition-[padding] duration-200 ${worldPanelInsetClass}`}>
         <div className="max-w-3xl mx-auto">
