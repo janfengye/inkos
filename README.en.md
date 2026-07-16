@@ -21,6 +21,14 @@
 </p>
 
 <p align="center">
+  <a href="https://platform.moonshot.ai/"><img src="https://gcdn.moonshot.cn/growth-cdn/sponsor/kimi-en.png" width="900" alt="Kimi sponsors InkOS"></a>
+</p>
+
+Thanks to Kimi for sponsoring this project! Kimi K2.7 is an open-source agentic model developed by Moonshot AI. With InkOS, Kimi can assist with planning, drafting, reviewing, and revising novels, scripts, interactive stories, and multilingual content, while InkOS manages characters, worldbuilding, plot threads, and persistent story state to keep long-form creation coherent and controllable.
+
+InkOS Studio already supports Moonshot (Kimi). Get an API key from the Kimi Open Platform ([中文站](https://platform.moonshot.cn/) | [Global](https://platform.moonshot.ai/)) and start creating.
+
+<p align="center">
   <a href="README.md">中文</a> | English | <a href="README.ja.md">日本語</a>
 </p>
 
@@ -67,6 +75,8 @@ This release continues the v1.5 direction: heavy actions are confirmable, comple
 </p>
 
 **Long-form novels** — create from a brief, generate foundations, chapter intent, context packages, prose, review, revision, and state settlement. Context is governed with protected / compressible layers so long books remain steerable.
+
+**Narrative forecast** — before writing the next chapter, generate 2-5 isolated future branches from current canon and compare their chapter beats, character decisions, projected changes, risks, and author-intent alignment directly in Studio Chat. Selecting a branch writes only `selected-branch-plan.md`; it does not change prose, outlines, or canonical state. Forecasts are marked stale when canon changes.
 
 **InkOS Short** — Studio chat and CLI can create a complete standalone short-fiction package: full manuscript, outline records, review records, synopsis, selling points, cover prompt, and an optional cover image when a cover provider is configured.
 
@@ -578,6 +588,7 @@ The first image is a local Studio screenshot. The other images are real local ou
 | `inkos short run` | Generate a standalone short-fiction package |
 | `inkos eval [id]` | Generate a quality evaluation report (`--json`, chapter ranges) |
 | `inkos consolidate [id]` | Consolidate chapter summaries for long-book context control |
+| `inkos forecast create/show/select` | Create, re-check, and select non-canonical long-form branches; selection saves a candidate plan only |
 | `inkos interact` | External-agent / CLI natural-language entry (`--json`, `--message`, `--book`) |
 | `inkos config set-global` | Set the global CLI / daemon / deployment LLM env config (`~/.inkos/.env`) |
 | `inkos config show-global` | Show the global config |
