@@ -69,8 +69,8 @@ import {
   normalizeSkillIdList as normalizeCoreSkillIdList,
   inferLanguage,
   createSkillRegistry,
-  loadConfiguredCapabilitySkills,
-  CapabilitySkillManifestSchema,
+  loadConfiguredAgentSkills,
+  parseAgentSkillDocument,
   getBuiltinPrompt,
   listBuiltinPromptPacks,
   listBuiltinPrompts,
@@ -79,8 +79,8 @@ import {
   toPosixPath,
   type ActionPayload,
   type ActionSource,
+  type AgentSkill,
   type BuiltinPrompt,
-  type CapabilitySkillManifest,
   createGenerateCoverTool,
   createInteractiveFilmCreationTool,
   createPlayStartTool,
@@ -119,7 +119,7 @@ import {
   type SessionKind,
   type AgentSessionAttachment,
 } from "@actalk/inkos-core";
-import { access, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { isSafeBookId } from "./safety.js";
 import { ApiError } from "./errors.js";
@@ -609,6 +609,9 @@ const MAX_AGENT_ATTACHMENTS = 8;
 const MAX_AGENT_ATTACHMENT_BYTES = 4 * 1024 * 1024;
 const MAX_AGENT_ATTACHMENT_TEXT_CHARS = 120_000;
 const MAX_TRANSLATION_UPLOAD_BYTES = 80 * 1024 * 1024;
+const MAX_SKILL_IMPORT_FILES = 128;
+const MAX_SKILL_IMPORT_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_SKILL_IMPORT_TOTAL_BYTES = 8 * 1024 * 1024;
 
 function safeUploadFileName(value: string): string {
   const trimmed = value.trim().replace(/[/\\\0]/g, "_").replace(/\s+/g, " ");
@@ -743,7 +746,7 @@ async function storeTranslationUpload(
 }
 
 function projectSkillsDir(root: string): string {
-  return join(root, ".inkos", "skills");
+  return join(root, ".agents", "skills");
 }
 
 function projectSkillDir(root: string, id: string): string {
@@ -754,19 +757,13 @@ function projectSkillPath(root: string, id: string): string {
   return join(projectSkillDir(root, id), "SKILL.md");
 }
 
-function toStudioSkill(skill: CapabilitySkillManifest, root: string, projectSkillIds: ReadonlySet<string>) {
+function toStudioSkill(skill: AgentSkill, root: string, projectSkillIds: ReadonlySet<string>) {
   const projectPath = projectSkillPath(root, skill.id);
   const isProjectFile = projectSkillIds.has(skill.id);
   return {
     id: skill.id,
     name: skill.name,
     description: skill.description,
-    whenToUse: skill.whenToUse,
-    triggers: skill.triggers,
-    sessionKinds: skill.sessionKinds,
-    promptPacks: skill.promptPacks,
-    toolHints: skill.toolHints,
-    contextNeeds: skill.contextNeeds,
     body: skill.body,
     source: isProjectFile ? "project" : skill.source,
     editable: isProjectFile,
@@ -774,66 +771,142 @@ function toStudioSkill(skill: CapabilitySkillManifest, root: string, projectSkil
   };
 }
 
-function normalizeSkillPayload(value: unknown, idOverride?: string): CapabilitySkillManifest {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new ApiError(400, "INVALID_SKILL_PAYLOAD", "Skill payload must be an object");
+interface StudioSkillImportFile {
+  readonly path: string;
+  readonly buffer: Buffer;
+}
+
+function normalizeSkillImportPath(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new ApiError(400, "INVALID_SKILL_IMPORT_PATH", "Skill import file path must be a string");
   }
-  const data = value as Record<string, unknown>;
-  const id = normalizeStudioSkillId(idOverride ?? data.id, "id");
-  const textOr = (field: string, fallback: string): string => {
-    const raw = data[field];
-    return typeof raw === "string" && raw.trim() ? raw.trim() : fallback;
-  };
-  const stringList = (field: string): string[] => (
-    Array.isArray(data[field])
-      ? data[field]
-          .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
-          .map((item) => item.trim())
-      : []
-  );
+  const normalized = value.trim().replaceAll("\\", "/").replace(/^\.\/+/, "");
+  if (
+    !normalized
+    || normalized.startsWith("/")
+    || /^[a-zA-Z]:\//.test(normalized)
+    || normalized.includes("\0")
+  ) {
+    throw new ApiError(400, "INVALID_SKILL_IMPORT_PATH", `Unsafe skill import path: ${value}`);
+  }
+  const parts = normalized.split("/");
+  if (parts.some((part) => !part || part === "." || part === "..")) {
+    throw new ApiError(400, "INVALID_SKILL_IMPORT_PATH", `Unsafe skill import path: ${value}`);
+  }
+  return parts.join("/");
+}
+
+function normalizeSkillImportFiles(value: unknown): {
+  readonly files: ReadonlyArray<StudioSkillImportFile>;
+  readonly manifestPath: string;
+} {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new ApiError(400, "INVALID_SKILL_IMPORT", "Skill import requires at least one file");
+  }
+  if (value.length > MAX_SKILL_IMPORT_FILES) {
+    throw new ApiError(413, "SKILL_IMPORT_TOO_MANY_FILES", `A skill may contain at most ${MAX_SKILL_IMPORT_FILES} files`);
+  }
+
+  const files: StudioSkillImportFile[] = [];
+  const seenPathKeys = new Set<string>();
+  let totalBytes = 0;
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new ApiError(400, "INVALID_SKILL_IMPORT", "Each skill import entry must be an object");
+    }
+    const record = item as Record<string, unknown>;
+    const path = normalizeSkillImportPath(record.path);
+    const pathKey = path.toLowerCase();
+    if (seenPathKeys.has(pathKey)) {
+      throw new ApiError(400, "INVALID_SKILL_IMPORT", `Duplicate skill import path: ${path}`);
+    }
+    if (typeof record.dataUrl !== "string") {
+      throw new ApiError(400, "INVALID_SKILL_IMPORT", `Missing dataUrl for ${path}`);
+    }
+    const { buffer } = parseDataUrl(record.dataUrl);
+    if (buffer.byteLength > MAX_SKILL_IMPORT_FILE_BYTES) {
+      throw new ApiError(413, "SKILL_IMPORT_FILE_TOO_LARGE", `${path} exceeds ${MAX_SKILL_IMPORT_FILE_BYTES} bytes`);
+    }
+    totalBytes += buffer.byteLength;
+    if (totalBytes > MAX_SKILL_IMPORT_TOTAL_BYTES) {
+      throw new ApiError(413, "SKILL_IMPORT_TOO_LARGE", `Skill folder exceeds ${MAX_SKILL_IMPORT_TOTAL_BYTES} bytes`);
+    }
+    seenPathKeys.add(pathKey);
+    files.push({ path, buffer });
+  }
+
+  const manifests = files.filter((file) => file.path === "SKILL.md" || file.path.endsWith("/SKILL.md"));
+  if (manifests.length !== 1) {
+    throw new ApiError(400, "INVALID_SKILL_IMPORT", "Skill import must contain exactly one SKILL.md");
+  }
+  const manifestPath = manifests[0]!.path;
+  const folder = manifestPath === "SKILL.md"
+    ? ""
+    : manifestPath.slice(0, -"/SKILL.md".length);
+  for (const file of files) {
+    if (folder && !file.path.startsWith(`${folder}/`)) {
+      throw new ApiError(400, "INVALID_SKILL_IMPORT_PATH", "All imported files must be inside the SKILL.md folder");
+    }
+  }
+  return { files, manifestPath };
+}
+
+async function importStudioSkillFolder(
+  root: string,
+  payload: unknown,
+): Promise<AgentSkill> {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new ApiError(400, "INVALID_SKILL_IMPORT", "Skill import payload must be an object");
+  }
+  const record = payload as Record<string, unknown>;
+  const { files, manifestPath } = normalizeSkillImportFiles(record.files);
+  const manifest = files.find((file) => file.path === manifestPath)!;
+  let parsed: AgentSkill;
   try {
-    return CapabilitySkillManifestSchema.parse({
-      id,
-      name: textOr("name", id),
-      description: textOr("description", "Project runtime skill."),
-      whenToUse: textOr("whenToUse", "Use when explicitly selected by the user."),
-      triggers: stringList("triggers"),
-      sessionKinds: stringList("sessionKinds"),
-      promptPacks: stringList("promptPacks"),
-      toolHints: stringList("toolHints"),
-      contextNeeds: Array.isArray(data.contextNeeds) ? data.contextNeeds : [],
-      body: typeof data.body === "string" ? data.body : "",
+    parsed = parseAgentSkillDocument(manifest.buffer.toString("utf-8"), {
+      skillPath: join(root, manifestPath),
       source: "project",
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new ApiError(400, "INVALID_SKILL_PAYLOAD", message);
+    throw new ApiError(
+      400,
+      "INVALID_SKILL_MANIFEST",
+      error instanceof Error ? error.message : String(error),
+    );
   }
-}
 
-function serializeProjectSkill(skill: CapabilitySkillManifest): string {
-  const frontmatter = {
-    id: skill.id,
-    name: skill.name,
-    description: skill.description,
-    whenToUse: skill.whenToUse,
-    triggers: skill.triggers,
-    sessionKinds: skill.sessionKinds,
-    promptPacks: skill.promptPacks,
-    toolHints: skill.toolHints,
-    contextNeeds: skill.contextNeeds,
-  };
-  return [
-    "---",
-    ...Object.entries(frontmatter).map(([key, value]) => `${key}: ${JSON.stringify(value)}`),
-    "---",
-    skill.body.trim(),
-    "",
-  ].join("\n");
+  const targetDir = projectSkillDir(root, parsed.id);
+  try {
+    await access(targetDir);
+    throw new ApiError(409, "SKILL_EXISTS", `Project skill already exists: ${parsed.id}`);
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+
+  await mkdir(projectSkillsDir(root), { recursive: true });
+  const stagingDir = join(projectSkillsDir(root), `.import-${randomUUID()}`);
+  const folder = manifestPath === "SKILL.md"
+    ? ""
+    : manifestPath.slice(0, -"/SKILL.md".length);
+  try {
+    await mkdir(stagingDir, { recursive: true });
+    for (const file of files) {
+      const relativePath = folder ? file.path.slice(folder.length + 1) : file.path;
+      const destination = join(stagingDir, relativePath);
+      await mkdir(dirname(destination), { recursive: true });
+      await writeFile(destination, file.buffer);
+    }
+    await rename(stagingDir, targetDir);
+  } catch (error) {
+    await rm(stagingDir, { recursive: true, force: true });
+    throw error;
+  }
+  return { ...parsed, source: "project", baseDir: targetDir };
 }
 
 async function loadStudioSkills(root: string) {
-  const configured = await loadConfiguredCapabilitySkills({ projectRoot: root });
+  const configured = await loadConfiguredAgentSkills({ projectRoot: root });
   const projectSkillIds = await listProjectSkillIds(root);
   const registry = createSkillRegistry({ skills: configured.skills });
   return {
@@ -3870,24 +3943,11 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string, o
     return c.json({ prompt: await toStudioPromptPackPrompt(root, prompt!) });
   });
 
-  app.post("/api/v1/skills", async (c) => {
+  app.post("/api/v1/skills/import", async (c) => {
     const payload = await c.req.json().catch(() => {
-      throw new ApiError(400, "INVALID_SKILL_PAYLOAD", "Skill payload must be JSON");
+      throw new ApiError(400, "INVALID_SKILL_IMPORT", "Skill import payload must be JSON");
     });
-    const skill = normalizeSkillPayload(payload);
-    await mkdir(projectSkillDir(root, skill.id), { recursive: true });
-    await writeFile(projectSkillPath(root, skill.id), serializeProjectSkill(skill), "utf-8");
-    return c.json({ skill: toStudioSkill(skill, root, new Set([skill.id])) });
-  });
-
-  app.put("/api/v1/skills/:skillId", async (c) => {
-    const id = normalizeStudioSkillId(c.req.param("skillId"), "skillId");
-    const payload = await c.req.json().catch(() => {
-      throw new ApiError(400, "INVALID_SKILL_PAYLOAD", "Skill payload must be JSON");
-    });
-    const skill = normalizeSkillPayload(payload, id);
-    await mkdir(projectSkillDir(root, skill.id), { recursive: true });
-    await writeFile(projectSkillPath(root, skill.id), serializeProjectSkill(skill), "utf-8");
+    const skill = await importStudioSkillFolder(root, payload);
     return c.json({ skill: toStudioSkill(skill, root, new Set([skill.id])) });
   });
 
